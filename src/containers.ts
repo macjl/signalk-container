@@ -15,6 +15,21 @@ function prefixedName(name: string): string {
     : `${CONTAINER_PREFIX}${name}`;
 }
 
+function qualifyImage(
+  image: string,
+  runtime: ContainerRuntimeInfo,
+): string {
+  // Podman requires fully qualified image names when unqualified-search
+  // registries are not configured. Prefix docker.io/ if missing.
+  if (runtime.runtime === "podman") {
+    const parts = image.split("/");
+    if (parts.length <= 2 && !parts[0].includes(".")) {
+      return `docker.io/${image}`;
+    }
+  }
+  return image;
+}
+
 export async function imageExists(
   runtime: ContainerRuntimeInfo,
   image: string,
@@ -64,7 +79,7 @@ function buildRunArgs(
   runtime: ContainerRuntimeInfo,
 ): string[] {
   const fullName = prefixedName(name);
-  const imageRef = `${config.image}:${config.tag}`;
+  const imageRef = qualifyImage(`${config.image}:${config.tag}`, runtime);
   const args = ["run", "-d", "--name", fullName];
 
   if (config.restart && config.restart !== "no") {
@@ -109,7 +124,7 @@ export async function ensureRunning(
 ): Promise<void> {
   const state = await getContainerState(runtime, name);
   const fullName = prefixedName(name);
-  const imageRef = `${config.image}:${config.tag}`;
+  const imageRef = qualifyImage(`${config.image}:${config.tag}`, runtime);
 
   switch (state) {
     case "running":

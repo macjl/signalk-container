@@ -145,23 +145,31 @@ module.exports = (app: App) => {
       },
     },
 
-    async start(config: PluginConfig) {
-      const preference = config.runtime ?? "auto";
-      runtimeInfo = await detectRuntime(preference);
+    start(config: PluginConfig) {
+      // Expose API on global so other plugins can find it.
+      // Each plugin gets a shallow copy of app (_.assign({}, app)),
+      // so setting on app doesn't propagate. Global is the shared bus.
+      (globalThis as any).__signalk_containerManager = api;
 
-      if (!runtimeInfo) {
-        app.setPluginError(
+      // Async init — server does not await start()
+      (async () => {
+        const preference = config.runtime ?? "auto";
+        app.debug("detecting runtime, preference=%s", preference);
+        runtimeInfo = await detectRuntime(preference);
+        app.debug("detectRuntime result: %o", runtimeInfo);
+
+        if (!runtimeInfo) {
+          app.setPluginError(
+            plugin.id,
+            "No container runtime found. Install Podman: sudo apt install podman",
+          );
+          return;
+        }
+
+        app.setPluginStatus(
           plugin.id,
-          "No container runtime found. Install Podman: sudo apt install podman",
+          `${runtimeInfo.runtime} ${runtimeInfo.version}${runtimeInfo.isPodmanDockerShim ? " (podman shim)" : ""}`,
         );
-        return;
-      }
-
-      app.setPluginStatus(
-        plugin.id,
-        `${runtimeInfo.runtime} ${runtimeInfo.version}${runtimeInfo.isPodmanDockerShim ? " (podman shim)" : ""}`,
-      );
-      (app as any).containerManager = api;
 
       if (config.pruneSchedule && config.pruneSchedule !== "off") {
         const intervalMs =
@@ -180,7 +188,13 @@ module.exports = (app: App) => {
         }, intervalMs);
       }
 
-      app.debug("Container manager started");
+        app.debug("Container manager started");
+      })().catch((err) => {
+        app.setPluginError(
+          plugin.id,
+          `Startup failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
     },
 
     stop() {
@@ -192,7 +206,7 @@ module.exports = (app: App) => {
         clearInterval(timer);
       }
       healthTimers = [];
-      delete (app as any).containerManager;
+      delete (globalThis as any).__signalk_containerManager;
     },
 
     registerWithRouter(router: IRouter) {
