@@ -120,7 +120,8 @@ export async function ensureRunning(
   name: string,
   config: ContainerConfig,
   debug: (msg: string) => void,
-  _options?: HealthCheckOptions,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  options?: HealthCheckOptions,
 ): Promise<void> {
   const state = await getContainerState(runtime, name);
   const fullName = prefixedName(name);
