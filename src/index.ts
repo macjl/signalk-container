@@ -19,6 +19,7 @@ import {
   listContainers,
   pruneImages,
   pullImage,
+  qualifyImage as qualifyImageForRuntime,
   removeContainer,
   stopContainer,
 } from "./containers";
@@ -35,7 +36,7 @@ interface App {
 module.exports = (app: App) => {
   let runtimeInfo: ContainerRuntimeInfo | null = null;
   let pruneTimer: NodeJS.Timeout | null = null;
-  let healthTimers: NodeJS.Timeout[] = [];
+  const healthTimers = new Map<string, NodeJS.Timeout>();
 
   const api: ContainerManagerApi = {
     getRuntime() {
@@ -44,12 +45,12 @@ module.exports = (app: App) => {
 
     async pullImage(image: string, onProgress?: (msg: string) => void) {
       if (!runtimeInfo) throw new Error("No container runtime available");
-      await pullImage(runtimeInfo, image, onProgress);
+      await pullImage(runtimeInfo, qualifyImageForRuntime(image, runtimeInfo), onProgress);
     },
 
     async imageExists(image: string) {
       if (!runtimeInfo) return false;
-      return imageExists(runtimeInfo, image);
+      return imageExists(runtimeInfo, qualifyImageForRuntime(image, runtimeInfo));
     },
 
     async ensureRunning(
@@ -67,6 +68,9 @@ module.exports = (app: App) => {
       );
 
       if (options?.healthCheck) {
+        const existing = healthTimers.get(name);
+        if (existing) clearInterval(existing);
+
         const timer = setInterval(async () => {
           try {
             const ok = await options.healthCheck!();
@@ -80,7 +84,7 @@ module.exports = (app: App) => {
             );
           }
         }, 60000);
-        healthTimers.push(timer);
+        healthTimers.set(name, timer);
       }
     },
 
@@ -199,10 +203,10 @@ module.exports = (app: App) => {
         clearInterval(pruneTimer);
         pruneTimer = null;
       }
-      for (const timer of healthTimers) {
+      for (const timer of healthTimers.values()) {
         clearInterval(timer);
       }
-      healthTimers = [];
+      healthTimers.clear();
       delete (globalThis as any).__signalk_containerManager;
     },
 

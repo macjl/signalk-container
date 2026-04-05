@@ -25,7 +25,11 @@ function exec(
         resolve({
           stdout: (stdout ?? "").toString().trim(),
           stderr: (stderr ?? "").toString().trim(),
-          exitCode: error ? ((error as any).code ?? 1) : 0,
+          exitCode: error
+            ? typeof (error as any).code === "number"
+              ? (error as any).code
+              : 1
+            : 0,
         });
       },
     );

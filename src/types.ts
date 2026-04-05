@@ -17,6 +17,7 @@ export interface ContainerConfig {
   env?: Record<string, string>;
   restart?: "no" | "unless-stopped" | "always";
   command?: string[];
+  networkMode?: string;
 }
 
 export interface ContainerInfo {

@@ -15,7 +15,7 @@ function prefixedName(name: string): string {
     : `${CONTAINER_PREFIX}${name}`;
 }
 
-function qualifyImage(
+export function qualifyImage(
   image: string,
   runtime: ContainerRuntimeInfo,
 ): string {
@@ -86,7 +86,11 @@ function buildRunArgs(
     args.push("--restart", config.restart);
   }
 
-  if (config.ports) {
+  if (config.networkMode) {
+    args.push("--network", config.networkMode);
+  }
+
+  if (config.ports && !config.networkMode) {
     for (const [containerPort, hostBind] of Object.entries(config.ports)) {
       const port = containerPort.replace(/\/tcp$/, "");
       args.push("-p", `${hostBind}:${port}`);

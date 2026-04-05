@@ -217,6 +217,17 @@ await containers.ensureRunning('my-db', {
 });
 ```
 
+Use `networkMode: 'host'` for containers that need direct access to the host network (e.g. multicast/broadcast discovery). Port mappings are ignored when `networkMode` is set.
+
+```typescript
+await containers.ensureRunning('mayara-server', {
+  image: 'ghcr.io/marineyachtradar/mayara-server',
+  tag: 'latest',
+  networkMode: 'host',
+  restart: 'unless-stopped'
+});
+```
+
 ### `stop(name): Promise<void>`
 Stops a running container. Idempotent.
 
