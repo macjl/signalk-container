@@ -88,6 +88,13 @@ export interface ContainerManagerApi {
   runJob(config: ContainerJobConfig): Promise<ContainerJobResult>;
   prune(): Promise<PruneResult>;
   listContainers(): Promise<ContainerInfo[]>;
+  ensureNetwork(name: string): Promise<void>;
+  removeNetwork(name: string): Promise<void>;
+  connectToNetwork(containerName: string, networkName: string): Promise<void>;
+  disconnectFromNetwork(
+    containerName: string,
+    networkName: string,
+  ): Promise<void>;
 }
 
 export interface PluginConfig {

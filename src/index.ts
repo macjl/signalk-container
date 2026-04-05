@@ -13,6 +13,9 @@ import {
 } from "./types";
 import { detectRuntime } from "./runtime";
 import {
+  connectToNetwork,
+  disconnectFromNetwork,
+  ensureNetwork,
   ensureRunning,
   getContainerState,
   imageExists,
@@ -21,6 +24,7 @@ import {
   pullImage,
   qualifyImage as qualifyImageForRuntime,
   removeContainer,
+  removeNetwork,
   startContainer,
   stopContainer,
 } from "./containers";
@@ -129,6 +133,26 @@ module.exports = (app: App) => {
     async listContainers(): Promise<ContainerInfo[]> {
       if (!runtimeInfo) return [];
       return listContainers(runtimeInfo);
+    },
+
+    async ensureNetwork(name: string) {
+      if (!runtimeInfo) throw new Error("No container runtime available");
+      await ensureNetwork(runtimeInfo, name);
+    },
+
+    async removeNetwork(name: string) {
+      if (!runtimeInfo) throw new Error("No container runtime available");
+      await removeNetwork(runtimeInfo, name);
+    },
+
+    async connectToNetwork(containerName: string, networkName: string) {
+      if (!runtimeInfo) throw new Error("No container runtime available");
+      await connectToNetwork(runtimeInfo, containerName, networkName);
+    },
+
+    async disconnectFromNetwork(containerName: string, networkName: string) {
+      if (!runtimeInfo) throw new Error("No container runtime available");
+      await disconnectFromNetwork(runtimeInfo, containerName, networkName);
     },
   };
 

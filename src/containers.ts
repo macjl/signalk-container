@@ -90,7 +90,7 @@ function buildRunArgs(
     args.push("--network", config.networkMode);
   }
 
-  if (config.ports && !config.networkMode) {
+  if (config.ports) {
     for (const [containerPort, hostBind] of Object.entries(config.ports)) {
       const port = containerPort.replace(/\/tcp$/, "");
       args.push("-p", `${hostBind}:${port}`);
@@ -247,6 +247,67 @@ export async function pruneImages(
     imagesRemoved: lines.filter((l) => l.match(/^[a-f0-9]{12,}/i)).length,
     spaceReclaimed: reclaimedMatch?.[1] ?? "0 B",
   };
+}
+
+export async function ensureNetwork(
+  runtime: ContainerRuntimeInfo,
+  name: string,
+): Promise<void> {
+  const exists = await execRuntime(runtime, ["network", "exists", name]);
+  if (exists.exitCode !== 0) {
+    const create = await execRuntime(runtime, ["network", "create", name]);
+    if (create.exitCode !== 0) {
+      throw new Error(`Failed to create network ${name}: ${create.stderr}`);
+    }
+  }
+}
+
+export async function removeNetwork(
+  runtime: ContainerRuntimeInfo,
+  name: string,
+): Promise<void> {
+  const result = await execRuntime(runtime, ["network", "rm", name]);
+  if (result.exitCode !== 0 && !result.stderr.includes("not found")) {
+    throw new Error(`Failed to remove network ${name}: ${result.stderr}`);
+  }
+}
+
+export async function connectToNetwork(
+  runtime: ContainerRuntimeInfo,
+  containerName: string,
+  networkName: string,
+): Promise<void> {
+  const fullName = prefixedName(containerName);
+  const result = await execRuntime(runtime, [
+    "network",
+    "connect",
+    networkName,
+    fullName,
+  ]);
+  if (result.exitCode !== 0 && !result.stderr.includes("already connected")) {
+    throw new Error(
+      `Failed to connect ${fullName} to ${networkName}: ${result.stderr}`,
+    );
+  }
+}
+
+export async function disconnectFromNetwork(
+  runtime: ContainerRuntimeInfo,
+  containerName: string,
+  networkName: string,
+): Promise<void> {
+  const fullName = prefixedName(containerName);
+  const result = await execRuntime(runtime, [
+    "network",
+    "disconnect",
+    networkName,
+    fullName,
+  ]);
+  if (result.exitCode !== 0 && !result.stderr.includes("not connected")) {
+    throw new Error(
+      `Failed to disconnect ${fullName} from ${networkName}: ${result.stderr}`,
+    );
+  }
 }
 
 export async function waitForReady(
