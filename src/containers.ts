@@ -262,10 +262,10 @@ export async function ensureNetwork(
   runtime: ContainerRuntimeInfo,
   name: string,
 ): Promise<void> {
-  const exists = await execRuntime(runtime, ["network", "exists", name]);
-  if (exists.exitCode !== 0) {
+  const inspect = await execRuntime(runtime, ["network", "inspect", name]);
+  if (inspect.exitCode !== 0) {
     const create = await execRuntime(runtime, ["network", "create", name]);
-    if (create.exitCode !== 0) {
+    if (create.exitCode !== 0 && !create.stderr.includes("already exists")) {
       throw new Error(`Failed to create network ${name}: ${create.stderr}`);
     }
   }

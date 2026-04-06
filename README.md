@@ -73,6 +73,11 @@ See [doc/plugin-developer-guide.md](doc/plugin-developer-guide.md) for the full 
 | `runJob(config)`                        | Execute a one-shot container job                             |
 | `prune()`                               | Remove dangling images                                       |
 | `listContainers()`                      | List all `sk-` prefixed containers                           |
+| `execInContainer(name, command)`        | Run a command inside a running container                     |
+| `ensureNetwork(name)`                   | Create a Podman/Docker network if it doesn't exist           |
+| `removeNetwork(name)`                   | Remove a network                                             |
+| `connectToNetwork(container, network)`  | Add a container to a network (bridge mode only)              |
+| `disconnectFromNetwork(container, net)` | Remove a container from a network                            |
 
 ## REST Endpoints
 

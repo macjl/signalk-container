@@ -232,7 +232,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         setActionStatus(`${name} started.`);
         fetchStatus();
       } else {
-        const data = await res.json();
+        const data = await res.json().catch(() => ({ error: res.statusText }));
         setActionStatus(`Failed: ${data.error}`);
         setStatusError(true);
       }
@@ -254,7 +254,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         setActionStatus(`${name} stopped.`);
         fetchStatus();
       } else {
-        const data = await res.json();
+        const data = await res.json().catch(() => ({ error: res.statusText }));
         setActionStatus(`Failed: ${data.error}`);
         setStatusError(true);
       }
@@ -279,7 +279,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         setActionStatus(`${name} removed.`);
         fetchStatus();
       } else {
-        const data = await res.json();
+        const data = await res.json().catch(() => ({ error: res.statusText }));
         setActionStatus(`Failed: ${data.error}`);
         setStatusError(true);
       }
@@ -298,13 +298,13 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         method: "POST",
       });
       if (res.ok) {
-        const data = await res.json();
+        const data = await res.json().catch(() => ({ error: res.statusText }));
         setPruneResult(data);
         setActionStatus(
           `Pruned ${data.imagesRemoved} image(s), reclaimed ${data.spaceReclaimed}.`,
         );
       } else {
-        const data = await res.json();
+        const data = await res.json().catch(() => ({ error: res.statusText }));
         setActionStatus(`Prune failed: ${data.error}`);
         setStatusError(true);
       }
