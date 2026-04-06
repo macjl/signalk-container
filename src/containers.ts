@@ -174,11 +174,41 @@ export async function startContainer(
   }
 }
 
+async function fixVolumePermissions(
+  runtime: ContainerRuntimeInfo,
+  name: string,
+): Promise<void> {
+  const fullName = prefixedName(name);
+  const state = await getContainerState(runtime, name);
+  if (state !== "running") return;
+
+  // Get bind-mounted volume destinations inside the container
+  const inspect = await execRuntime(runtime, [
+    "inspect",
+    "--format",
+    '{{range .Mounts}}{{if eq .Type "bind"}}{{.Destination}} {{end}}{{end}}',
+    fullName,
+  ]);
+  const mounts = inspect.stdout.trim().split(/\s+/).filter(Boolean);
+  if (mounts.length === 0) return;
+
+  // Fix permissions so the host user can delete the files
+  await execRuntime(runtime, [
+    "exec",
+    fullName,
+    "chmod",
+    "-R",
+    "a+rwX",
+    ...mounts,
+  ]);
+}
+
 export async function stopContainer(
   runtime: ContainerRuntimeInfo,
   name: string,
 ): Promise<void> {
   const fullName = prefixedName(name);
+  await fixVolumePermissions(runtime, name).catch(() => {});
   const result = await execRuntime(runtime, ["stop", fullName]);
   if (result.exitCode !== 0) {
     const state = await getContainerState(runtime, name);
@@ -193,6 +223,7 @@ export async function removeContainer(
   name: string,
 ): Promise<void> {
   const fullName = prefixedName(name);
+  await fixVolumePermissions(runtime, name).catch(() => {});
   await execRuntime(runtime, ["stop", fullName]);
   const result = await execRuntime(runtime, ["rm", "-f", fullName]);
   if (result.exitCode !== 0) {
