@@ -17,6 +17,7 @@ import {
   disconnectFromNetwork,
   ensureNetwork,
   ensureRunning,
+  execInContainer,
   getContainerState,
   imageExists,
   listContainers,
@@ -133,6 +134,11 @@ module.exports = (app: App) => {
     async listContainers(): Promise<ContainerInfo[]> {
       if (!runtimeInfo) return [];
       return listContainers(runtimeInfo);
+    },
+
+    async execInContainer(name: string, command: string[]) {
+      if (!runtimeInfo) throw new Error("No container runtime available");
+      return execInContainer(runtimeInfo, name, command);
     },
 
     async ensureNetwork(name: string) {

@@ -91,6 +91,10 @@ export interface ContainerManagerApi {
   ensureNetwork(name: string): Promise<void>;
   removeNetwork(name: string): Promise<void>;
   connectToNetwork(containerName: string, networkName: string): Promise<void>;
+  execInContainer(
+    name: string,
+    command: string[],
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }>;
   disconnectFromNetwork(
     containerName: string,
     networkName: string,

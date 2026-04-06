@@ -249,6 +249,15 @@ export async function pruneImages(
   };
 }
 
+export async function execInContainer(
+  runtime: ContainerRuntimeInfo,
+  name: string,
+  command: string[],
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const fullName = prefixedName(name);
+  return execRuntime(runtime, ["exec", fullName, ...command]);
+}
+
 export async function ensureNetwork(
   runtime: ContainerRuntimeInfo,
   name: string,
