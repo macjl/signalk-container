@@ -5,6 +5,18 @@ export interface ContainerRuntimeInfo {
   runtime: RuntimeName;
   version: string;
   isPodmanDockerShim: boolean;
+  /**
+   * cgroup v2 controllers actually available to this runtime, e.g.
+   * `["cpu", "memory", "pids"]` on a typical rootless podman setup
+   * where cpuset is not delegated. `null` means "not probed" — treat
+   * all controllers as available (used for docker, where we can't
+   * easily query the per-runtime view).
+   *
+   * Used by `resources.ts` to silently drop ContainerResourceLimits
+   * fields whose backing controller is missing, instead of letting
+   * the runtime fail at container-create time.
+   */
+  cgroupControllers?: string[] | null;
 }
 
 export type ContainerState = "running" | "stopped" | "missing" | "no-runtime";

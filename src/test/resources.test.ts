@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  filterUnsupportedLimits,
   mergeResourceLimits,
   resourceFlagsForRun,
   resourceFlagsForUpdate,
@@ -10,10 +11,23 @@ import {
 } from "../resources";
 import type { ContainerRuntimeInfo } from "../types";
 
+// "Default" runtime: no probed cgroup controllers, treats all
+// fields as supported. Matches docker (where we don't probe) and
+// podman versions older than the v016 probing logic.
 const dummyRuntime: ContainerRuntimeInfo = {
   runtime: "podman",
   version: "5.0.0",
   isPodmanDockerShim: false,
+};
+
+// Realistic rootless-podman runtime: cpu/memory/pids delegated, but
+// NOT cpuset. This is the actual config on Dirk's dev VM and matches
+// systemd's default delegate-controllers list.
+const restrictedRuntime: ContainerRuntimeInfo = {
+  runtime: "podman",
+  version: "5.4.2",
+  isPodmanDockerShim: false,
+  cgroupControllers: ["cpu", "memory", "pids"],
 };
 
 function fakeExec(
@@ -96,35 +110,41 @@ describe("mergeResourceLimits", () => {
 
 describe("resourceFlagsForRun", () => {
   it("returns empty for undefined limits", () => {
-    assert.deepEqual(resourceFlagsForRun(undefined), []);
+    assert.deepEqual(resourceFlagsForRun(undefined, dummyRuntime), []);
   });
 
   it("returns empty for empty limits object", () => {
-    assert.deepEqual(resourceFlagsForRun({}), []);
+    assert.deepEqual(resourceFlagsForRun({}, dummyRuntime), []);
   });
 
   it("translates cpus", () => {
-    assert.deepEqual(resourceFlagsForRun({ cpus: 1.5 }), ["--cpus", "1.5"]);
+    assert.deepEqual(resourceFlagsForRun({ cpus: 1.5 }, dummyRuntime), [
+      "--cpus",
+      "1.5",
+    ]);
   });
 
   it("translates memory", () => {
-    assert.deepEqual(resourceFlagsForRun({ memory: "512m" }), [
+    assert.deepEqual(resourceFlagsForRun({ memory: "512m" }, dummyRuntime), [
       "--memory",
       "512m",
     ]);
   });
 
   it("translates all fields together", () => {
-    const flags = resourceFlagsForRun({
-      cpus: 1.5,
-      cpuShares: 512,
-      cpusetCpus: "1,2",
-      memory: "512m",
-      memorySwap: "512m",
-      memoryReservation: "256m",
-      pidsLimit: 200,
-      oomScoreAdj: 500,
-    });
+    const flags = resourceFlagsForRun(
+      {
+        cpus: 1.5,
+        cpuShares: 512,
+        cpusetCpus: "1,2",
+        memory: "512m",
+        memorySwap: "512m",
+        memoryReservation: "256m",
+        pidsLimit: 200,
+        oomScoreAdj: 500,
+      },
+      dummyRuntime,
+    );
     assert.deepEqual(flags, [
       "--cpus",
       "1.5",
@@ -146,17 +166,49 @@ describe("resourceFlagsForRun", () => {
   });
 
   it("skips null fields (treated like unset)", () => {
-    assert.deepEqual(resourceFlagsForRun({ cpus: 1.25, memory: null }), [
-      "--cpus",
-      "1.25",
-    ]);
+    assert.deepEqual(
+      resourceFlagsForRun({ cpus: 1.25, memory: null }, dummyRuntime),
+      ["--cpus", "1.25"],
+    );
   });
 
   it("skips undefined fields", () => {
-    assert.deepEqual(resourceFlagsForRun({ cpus: 1.25, memory: undefined }), [
+    assert.deepEqual(
+      resourceFlagsForRun({ cpus: 1.25, memory: undefined }, dummyRuntime),
+      ["--cpus", "1.25"],
+    );
+  });
+
+  it("drops cpusetCpus when cpuset controller is unavailable", () => {
+    // Bug B regression test: on a host without cpuset delegation
+    // (like rootless podman on most systems), `cpusetCpus` must be
+    // silently dropped from the flag list rather than passed to
+    // podman where it would fail at OCI runtime time.
+    const flags = resourceFlagsForRun(
+      { cpus: 1.5, cpusetCpus: "1,2", memory: "512m" },
+      restrictedRuntime,
+    );
+    assert.deepEqual(flags, ["--cpus", "1.5", "--memory", "512m"]);
+  });
+
+  it("keeps fields whose controller IS available", () => {
+    const flags = resourceFlagsForRun(
+      { cpus: 1.5, memory: "512m", pidsLimit: 200 },
+      restrictedRuntime,
+    );
+    assert.deepEqual(flags, [
       "--cpus",
-      "1.25",
+      "1.5",
+      "--memory",
+      "512m",
+      "--pids-limit",
+      "200",
     ]);
+  });
+
+  it("oomScoreAdj is always allowed (not gated by cgroup controllers)", () => {
+    const flags = resourceFlagsForRun({ oomScoreAdj: 500 }, restrictedRuntime);
+    assert.deepEqual(flags, ["--oom-score-adj", "500"]);
   });
 });
 
@@ -287,15 +339,31 @@ describe("tryLiveUpdate", () => {
     assert.equal(called, false, "exec must not be called for non-live limits");
   });
 
-  it("returns ok=true vacuously WITHOUT calling exec for empty limits", async () => {
-    let called = false;
-    const exec: ExecRuntimeFn = async () => {
-      called = true;
-      return { exitCode: 0, stdout: "", stderr: "" };
+  it("for empty limits, calls exec with `inspect` to verify container exists (Bug C fix)", async () => {
+    // Old behavior was to return ok=true vacuously without any exec
+    // call, which meant `updateResources({})` against a removed
+    // container claimed success and corrupted the internal cache.
+    // The new behavior is: call `inspect` first; only return ok=true
+    // if the container actually exists.
+    const captured = { args: [] as string[] };
+    const exec: ExecRuntimeFn = async (_runtime, args) => {
+      captured.args = args;
+      return { exitCode: 0, stdout: "[{}]", stderr: "" };
     };
     const result = await tryLiveUpdate(dummyRuntime, "sk-x", {}, exec);
     assert.equal(result.ok, true);
-    assert.equal(called, false);
+    assert.deepEqual(captured.args, ["inspect", "sk-x"]);
+  });
+
+  it("for empty limits AND missing container, returns ok=false", async () => {
+    const exec: ExecRuntimeFn = async () => ({
+      exitCode: 1,
+      stdout: "",
+      stderr: "no such object: sk-x",
+    });
+    const result = await tryLiveUpdate(dummyRuntime, "sk-x", {}, exec);
+    assert.equal(result.ok, false);
+    assert.match(result.stderr ?? "", /does not exist/);
   });
 });
 
@@ -340,5 +408,152 @@ describe("resourceLimitsEqual", () => {
       resourceLimitsEqual({ cpus: 1.5, memory: null }, { cpus: 1.5 }),
       true,
     );
+  });
+});
+
+describe("filterUnsupportedLimits (Bug B)", () => {
+  it("accepts everything when cgroupControllers is undefined (not probed)", () => {
+    const { accepted, dropped } = filterUnsupportedLimits(
+      { cpus: 1.5, cpusetCpus: "0,1", memory: "512m", oomScoreAdj: 100 },
+      dummyRuntime,
+    );
+    assert.deepEqual(accepted, {
+      cpus: 1.5,
+      cpusetCpus: "0,1",
+      memory: "512m",
+      oomScoreAdj: 100,
+    });
+    assert.deepEqual(dropped, []);
+  });
+
+  it("accepts everything when cgroupControllers is null", () => {
+    const runtime: ContainerRuntimeInfo = {
+      ...dummyRuntime,
+      cgroupControllers: null,
+    };
+    const { accepted, dropped } = filterUnsupportedLimits(
+      { cpusetCpus: "0,1" },
+      runtime,
+    );
+    assert.deepEqual(accepted, { cpusetCpus: "0,1" });
+    assert.deepEqual(dropped, []);
+  });
+
+  it("drops cpusetCpus when cpuset controller is missing", () => {
+    const { accepted, dropped } = filterUnsupportedLimits(
+      { cpus: 1.5, cpusetCpus: "0,1", memory: "512m" },
+      restrictedRuntime,
+    );
+    assert.deepEqual(accepted, { cpus: 1.5, memory: "512m" });
+    assert.equal(dropped.length, 1);
+    assert.equal(dropped[0].field, "cpusetCpus");
+    assert.match(dropped[0].reason, /cpuset/);
+    assert.match(dropped[0].reason, /podman/);
+  });
+
+  it("oomScoreAdj is always allowed (no cgroup controller dependency)", () => {
+    const { accepted, dropped } = filterUnsupportedLimits(
+      { oomScoreAdj: 500 },
+      restrictedRuntime,
+    );
+    assert.deepEqual(accepted, { oomScoreAdj: 500 });
+    assert.deepEqual(dropped, []);
+  });
+
+  it("preserves null and undefined fields verbatim (merge layer handles them)", () => {
+    const { accepted } = filterUnsupportedLimits(
+      { cpus: 1.0, memory: null, cpusetCpus: undefined },
+      restrictedRuntime,
+    );
+    assert.equal(accepted.cpus, 1.0);
+    assert.equal(accepted.memory, null);
+    assert.ok(!("cpusetCpus" in accepted) || accepted.cpusetCpus === undefined);
+  });
+
+  it("drops multiple fields and reports each separately", () => {
+    const stripped: ContainerRuntimeInfo = {
+      ...dummyRuntime,
+      // Only memory available — wildly restricted setup
+      cgroupControllers: ["memory"],
+    };
+    const { accepted, dropped } = filterUnsupportedLimits(
+      {
+        cpus: 1.5,
+        cpuShares: 512,
+        cpusetCpus: "0",
+        memory: "512m",
+        pidsLimit: 100,
+      },
+      stripped,
+    );
+    assert.deepEqual(accepted, { memory: "512m" });
+    assert.equal(dropped.length, 4);
+    const droppedFields = new Set(dropped.map((d) => d.field));
+    assert.ok(droppedFields.has("cpus"));
+    assert.ok(droppedFields.has("cpuShares"));
+    assert.ok(droppedFields.has("cpusetCpus"));
+    assert.ok(droppedFields.has("pidsLimit"));
+  });
+
+  it("does not mutate the input limits", () => {
+    const input = { cpus: 1.5, cpusetCpus: "0,1" };
+    filterUnsupportedLimits(input, restrictedRuntime);
+    assert.deepEqual(input, { cpus: 1.5, cpusetCpus: "0,1" });
+  });
+});
+
+describe("tryLiveUpdate Bug C: container existence check", () => {
+  it("with empty filtered limits AND missing container, returns ok=false", async () => {
+    // After filtering, no flags need to be applied. The old code
+    // would vacuously return ok=true here, even if the container
+    // doesn't exist. The new code MUST verify existence first.
+    const exec = fakeExec({ exitCode: 1, stderr: "no such object" });
+    const result = await tryLiveUpdate(
+      restrictedRuntime,
+      "sk-mayara",
+      // Only field is cpusetCpus, which gets filtered out → empty
+      { cpusetCpus: "0,1" },
+      exec,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.stderr ?? "", /does not exist/);
+  });
+
+  it("with empty filtered limits AND existing container, returns ok=true", async () => {
+    const exec = fakeExec({ exitCode: 0, stdout: "[{}]" });
+    const result = await tryLiveUpdate(
+      restrictedRuntime,
+      "sk-mayara",
+      { cpusetCpus: "0,1" },
+      exec,
+    );
+    assert.equal(result.ok, true);
+  });
+
+  it("with normal limits, no existence check is performed (delegated to update command)", async () => {
+    const exec = fakeExec({ exitCode: 0 });
+    const result = await tryLiveUpdate(
+      dummyRuntime,
+      "sk-mayara",
+      { cpus: 1.5 },
+      exec,
+    );
+    assert.equal(result.ok, true);
+  });
+
+  it("filters cgroup-unavailable fields BEFORE deciding live-update viability", async () => {
+    // Pure regression test for the integration: cpusetCpus + cpus, on
+    // a runtime with no cpuset → cpusetCpus is dropped → only cpus
+    // remains → live-updatable → exec gets called with --cpus only.
+    const captured = { args: [] as string[] };
+    const exec = fakeExec({ exitCode: 0 }, captured);
+    const result = await tryLiveUpdate(
+      restrictedRuntime,
+      "sk-mayara",
+      { cpus: 1.5, cpusetCpus: "0,1" },
+      exec,
+    );
+    assert.equal(result.ok, true);
+    assert.deepEqual(captured.args, ["update", "--cpus", "1.5", "sk-mayara"]);
   });
 });

@@ -15,6 +15,7 @@ import {
   UpdateResourcesResult,
 } from "./types";
 import {
+  filterUnsupportedLimits,
   mergeResourceLimits,
   resourceLimitsEqual,
   tryLiveUpdate,
@@ -28,6 +29,7 @@ import {
   execInContainer,
   getContainerState,
   getImageDigest,
+  getLiveResources,
   imageExists,
   listContainers,
   pruneImages,
@@ -116,14 +118,34 @@ module.exports = (app: App) => {
         config.resources,
         currentOverrides[name],
       );
+      // Drop fields whose backing cgroup controller is unavailable on
+      // this host (Bug B). Log them once so the user knows their
+      // override is being ignored. Without this filter, an override
+      // with `cpusetCpus` on rootless podman would cause `podman run`
+      // to fail with a cryptic OCI error.
+      const { accepted: filteredMerged, dropped } = filterUnsupportedLimits(
+        merged,
+        runtimeInfo,
+      );
+      for (const d of dropped) {
+        app.debug(
+          `ensureRunning(${name}): dropped resources.${d.field}: ${d.reason}`,
+        );
+      }
       const effectiveConfig: ContainerConfig = {
         ...config,
-        resources: merged,
+        resources: filteredMerged,
       };
 
       // Cache for later updateResources() recreate-fallback path.
       lastConfigs.set(name, effectiveConfig);
-      effectiveResources.set(name, merged);
+      effectiveResources.set(name, filteredMerged);
+
+      // Capture the running container's existing resources BEFORE
+      // calling ensureRunning, so we can detect "already running but
+      // limits differ" (Bug D). If the container is missing,
+      // getLiveResources returns {} and the diff won't trigger.
+      const preLimits = await getLiveResources(runtimeInfo, name);
 
       await ensureRunning(
         runtimeInfo,
@@ -132,6 +154,32 @@ module.exports = (app: App) => {
         (msg) => app.debug(msg),
         options,
       );
+
+      // Bug D: if ensureRunning was a no-op (container was already
+      // running) AND the requested limits differ from the live state,
+      // fire a live update to bring them in line. This is what makes
+      // user `containerOverrides` config changes take effect on the
+      // next consumer-plugin restart without forcing a recreate.
+      if (!resourceLimitsEqual(preLimits, filteredMerged)) {
+        const fullName = name.startsWith("sk-") ? name : `sk-${name}`;
+        const live = await tryLiveUpdate(runtimeInfo, fullName, filteredMerged);
+        if (!live.ok) {
+          // Live update failed (e.g. cpuset on a host that doesn't
+          // delegate it). The container is still running with its
+          // OLD limits, which is fine — log a warning so the user
+          // can see why their override didn't take effect, but
+          // don't throw, since the container itself is healthy.
+          app.error(
+            `ensureRunning(${name}): live resource update failed: ${live.stderr ?? "unknown reason"}. ` +
+              `Container is running with previous limits. ` +
+              `Use POST /api/containers/${name}/resources to force a recreate.`,
+          );
+        } else {
+          app.debug(
+            `ensureRunning(${name}): live-updated resources to match new config`,
+          );
+        }
+      }
 
       if (options?.healthCheck) {
         const existing = healthTimers.get(name);
@@ -221,33 +269,67 @@ module.exports = (app: App) => {
       if (!runtimeInfo) throw new Error("No container runtime available");
 
       const fullName = name.startsWith("sk-") ? name : `sk-${name}`;
+      const warnings: string[] = [];
+
+      // Filter the requested limits against the runtime's actual
+      // cgroup capabilities. Dropping a field here is silent at the
+      // resources.ts layer; we surface it once via app.debug so the
+      // user knows their override is being ignored. (Bug B fix.)
+      const { accepted: filteredLimits, dropped } = filterUnsupportedLimits(
+        limits,
+        runtimeInfo,
+      );
+      for (const d of dropped) {
+        const w = `dropped resources.${d.field}: ${d.reason}`;
+        warnings.push(w);
+        app.debug(`updateResources(${name}): ${w}`);
+      }
+
       const previous = effectiveResources.get(name) ?? {};
 
-      // No-op when nothing actually changes.
-      if (resourceLimitsEqual(previous, limits)) {
-        return { method: "live" };
+      // No-op when nothing actually changes — but verify the container
+      // exists first, otherwise we'd silently claim success against a
+      // container that was removed out from under us. (Part of Bug C
+      // fix; tryLiveUpdate also enforces this for the empty-flags case.)
+      if (resourceLimitsEqual(previous, filteredLimits)) {
+        const state = await getContainerState(runtimeInfo, name);
+        if (state === "missing") {
+          throw new Error(
+            `updateResources: container ${fullName} does not exist`,
+          );
+        }
+        return {
+          method: "live",
+          warnings: warnings.length ? warnings : undefined,
+        };
       }
 
       // Try the runtime's live `update` first — instantaneous, no
       // downtime — and only fall back to recreate when it refuses.
-      const live = await tryLiveUpdate(runtimeInfo, fullName, limits);
+      const live = await tryLiveUpdate(runtimeInfo, fullName, filteredLimits);
       if (live.ok) {
-        effectiveResources.set(name, { ...limits });
+        effectiveResources.set(name, { ...filteredLimits });
         // Also keep the cached ContainerConfig in sync so that a
         // future recreate (e.g. on plugin restart) preserves the
         // newer limits.
         const cached = lastConfigs.get(name);
         if (cached) {
-          lastConfigs.set(name, { ...cached, resources: { ...limits } });
+          lastConfigs.set(name, {
+            ...cached,
+            resources: { ...filteredLimits },
+          });
         }
-        return { method: "live" };
+        return {
+          method: "live",
+          warnings: warnings.length ? warnings : undefined,
+        };
       }
 
       // Live update refused (cpuset on incompatible kernel, oom-score-adj,
       // or runtime quirk). Fall back to stop+remove+ensureRunning if we
       // have the original config cached.
-      const cached = lastConfigs.get(name);
-      if (!cached) {
+      const cachedConfig = lastConfigs.get(name);
+      if (!cachedConfig) {
         throw new Error(
           `updateResources: cannot recreate ${name} — no cached ContainerConfig. ` +
             `Live update failed: ${live.stderr ?? "unknown reason"}. ` +
@@ -255,11 +337,19 @@ module.exports = (app: App) => {
         );
       }
 
-      const warnings = live.stderr ? [`live update: ${live.stderr}`] : [];
+      if (live.stderr) {
+        warnings.push(`live update: ${live.stderr}`);
+      }
+
       const newConfig: ContainerConfig = {
-        ...cached,
-        resources: { ...limits },
+        ...cachedConfig,
+        resources: { ...filteredLimits },
       };
+
+      // Capture pre-recreate state so we can roll back if the
+      // recreate fails. The cached ContainerConfig IS the rollback
+      // target — it's what the consumer plugin most recently asked
+      // for, minus our new resources. (Bug A fix.)
       try {
         await removeContainer(runtimeInfo, name);
       } catch (err) {
@@ -267,11 +357,74 @@ module.exports = (app: App) => {
           `remove during recreate: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
-      await ensureRunning(runtimeInfo, name, newConfig, (msg) =>
-        app.debug(msg),
-      );
+
+      try {
+        await ensureRunning(runtimeInfo, name, newConfig, (msg) =>
+          app.debug(msg),
+        );
+      } catch (recreateErr) {
+        // Recreate failed — the container is gone or in a bad state.
+        // Try to roll back to the previous config so the consumer
+        // plugin's container is at least back to working order.
+        const recreateMsg =
+          recreateErr instanceof Error
+            ? recreateErr.message
+            : String(recreateErr);
+        app.error(
+          `updateResources(${name}): recreate with new limits failed, attempting rollback: ${recreateMsg}`,
+        );
+
+        try {
+          // Make sure no half-created container is in the way.
+          await removeContainer(runtimeInfo, name).catch(() => {});
+          await ensureRunning(runtimeInfo, name, cachedConfig, (msg) =>
+            app.debug(msg),
+          );
+          // Rollback succeeded — internal state is unchanged. Throw a
+          // wrapper that carries the original recreate error as `cause`
+          // so callers can introspect the underlying podman failure.
+          throw new Error(
+            `Failed to apply new resources for ${name}: ${recreateMsg}. ` +
+              `Container rolled back to previous config; the new limits were NOT applied.`,
+            { cause: recreateErr },
+          );
+        } catch (rollbackErr) {
+          // Both the new-config recreate AND the rollback failed.
+          // The container is genuinely gone and we can't bring it back.
+          // Clear our caches so getResources/listConfigs don't lie.
+          const rollbackMsg =
+            rollbackErr instanceof Error
+              ? rollbackErr.message
+              : String(rollbackErr);
+          // Don't shadow the rollback error if it's our own re-thrown
+          // success message — only treat genuinely-different errors as
+          // fatal.
+          if (rollbackErr === recreateErr || rollbackMsg === recreateMsg) {
+            // Same error came back from rollback — original throw above.
+            throw rollbackErr;
+          }
+          if (rollbackMsg.startsWith("Failed to apply new resources")) {
+            // This was the success-with-rollback message thrown above.
+            throw rollbackErr;
+          }
+          lastConfigs.delete(name);
+          effectiveResources.delete(name);
+          app.setPluginError(
+            `Container ${name} is in an indeterminate state: ` +
+              `recreate failed (${recreateMsg}) AND rollback failed (${rollbackMsg}). ` +
+              `Manual intervention required.`,
+          );
+          throw new Error(
+            `Failed to apply new resources for ${name} (${recreateMsg}) ` +
+              `AND failed to roll back (${rollbackMsg}). ` +
+              `Container is in an indeterminate state, manual intervention required.`,
+            { cause: rollbackErr },
+          );
+        }
+      }
+
       lastConfigs.set(name, newConfig);
-      effectiveResources.set(name, { ...limits });
+      effectiveResources.set(name, { ...filteredLimits });
       return { method: "recreated", warnings };
     },
 

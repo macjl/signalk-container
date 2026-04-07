@@ -67,11 +67,61 @@ async function tryRuntime(
     isPodmanDockerShim = result.stdout.toLowerCase().includes("podman");
   }
 
+  const realRuntime: RuntimeName = isPodmanDockerShim ? "podman" : name;
+  const cgroupControllers = await probeCgroupControllers(realRuntime, env);
+
   return {
-    runtime: isPodmanDockerShim ? "podman" : name,
+    runtime: realRuntime,
     version,
     isPodmanDockerShim,
+    cgroupControllers,
   };
+}
+
+/**
+ * Query the runtime for which cgroup v2 controllers are actually
+ * available to it. This matters for rootless podman, which on many
+ * systems has cgroup delegation only for `cpu memory pids` and is
+ * missing `cpuset` (the systemd default delegate-controllers list
+ * does not include cpuset).
+ *
+ * Returns an array of controller names for podman, or `null` for
+ * docker (which doesn't expose this via `info --format` and where
+ * full controller availability is the typical case).
+ */
+async function probeCgroupControllers(
+  runtime: RuntimeName,
+  env: NodeJS.ProcessEnv,
+): Promise<string[] | null> {
+  if (runtime !== "podman") {
+    // Docker doesn't expose CgroupControllers via `info --format`.
+    // Assume all controllers are available — docker typically runs
+    // as root with full systemd delegation, so this is correct in
+    // the common case. Users hitting cgroup limitations on docker
+    // can still see the original runtime error and adjust.
+    return null;
+  }
+
+  const result = await exec(
+    "podman",
+    ["info", "--format", "{{json .Host.CgroupControllers}}"],
+    env,
+  );
+  if (result.exitCode !== 0) {
+    // Older podman versions, or podman info hung — fall back to
+    // "not probed" rather than misleadingly empty.
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(result.stdout) as unknown;
+    if (Array.isArray(parsed) && parsed.every((s) => typeof s === "string")) {
+      return parsed;
+    }
+  } catch {
+    // Malformed JSON — treat as not probed.
+  }
+  return null;
 }
 
 export async function detectRuntime(

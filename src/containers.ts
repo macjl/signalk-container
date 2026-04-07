@@ -120,6 +120,135 @@ export async function getContainerState(
   return "stopped";
 }
 
+/**
+ * Type alias matching `ExecRuntimeFn` in resources.ts; declared
+ * locally so containers.ts doesn't have to depend on resources.ts.
+ */
+type ExecFn = (
+  runtime: ContainerRuntimeInfo,
+  args: string[],
+) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+
+/**
+ * Read the live resource limits applied to a managed container,
+ * straight from `podman inspect` (i.e. the actual cgroup state).
+ * Returns an empty object if the container is missing or no
+ * limits are applied. Used by:
+ *
+ *   - the `updateResources` rollback path, to capture pre-update
+ *     state so a failed recreate can be reverted
+ *   - `ensureRunning`'s diff detection, to decide whether a running
+ *     container needs a live resources update
+ *
+ * The shape conversion is the inverse of `resourceFlagsForRun`:
+ *   NanoCpus       (nanoseconds/sec) → cpus (cores)
+ *   Memory         (bytes)           → memory ("123m")
+ *   MemorySwap     (bytes)           → memorySwap ("123m")
+ *   ...etc.
+ *
+ * Memory values are emitted as bytes-with-suffix to round-trip
+ * cleanly with what consumer plugins typically pass in (`"512m"`).
+ *
+ * `exec` defaults to the production execRuntime; tests pass a stub.
+ */
+export async function getLiveResources(
+  runtime: ContainerRuntimeInfo,
+  name: string,
+  exec: ExecFn = execRuntime,
+): Promise<import("./types").ContainerResourceLimits> {
+  const fullName = prefixedName(name);
+  // Use Go-template format for reliable parsing across podman/docker.
+  // Each line is one numeric or string value; empty/zero means "unset".
+  const fmt =
+    "{{.HostConfig.NanoCpus}}|" +
+    "{{.HostConfig.CpuShares}}|" +
+    "{{.HostConfig.CpusetCpus}}|" +
+    "{{.HostConfig.Memory}}|" +
+    "{{.HostConfig.MemorySwap}}|" +
+    "{{.HostConfig.MemoryReservation}}|" +
+    "{{.HostConfig.PidsLimit}}|" +
+    "{{.HostConfig.OomScoreAdj}}";
+  const result = await exec(runtime, ["inspect", "--format", fmt, fullName]);
+  if (result.exitCode !== 0) return {};
+
+  const parts = result.stdout.split("|");
+  if (parts.length !== 8) return {};
+
+  const [
+    nanoCpus,
+    cpuShares,
+    cpusetCpus,
+    memory,
+    memorySwap,
+    memoryReservation,
+    pidsLimit,
+    oomScoreAdj,
+  ] = parts;
+
+  const out: import("./types").ContainerResourceLimits = {};
+
+  const nano = Number(nanoCpus);
+  if (Number.isFinite(nano) && nano > 0) {
+    // Round to 3 decimals to avoid float noise like 1.4999999999.
+    out.cpus = Math.round((nano / 1_000_000_000) * 1000) / 1000;
+  }
+  const shares = Number(cpuShares);
+  // 0 and 1024 are both "default" — only emit if explicitly set to
+  // something else, since 1024 is the kernel default and we'd add
+  // noise to comparisons.
+  if (Number.isFinite(shares) && shares > 0 && shares !== 1024) {
+    out.cpuShares = shares;
+  }
+  if (cpusetCpus && cpusetCpus.trim() !== "") {
+    out.cpusetCpus = cpusetCpus.trim();
+  }
+  const mem = Number(memory);
+  if (Number.isFinite(mem) && mem > 0) {
+    out.memory = bytesToString(mem);
+  }
+  const memSwap = Number(memorySwap);
+  // memorySwap is reported as -1 when unlimited; we only care about
+  // explicit caps.
+  if (Number.isFinite(memSwap) && memSwap > 0) {
+    out.memorySwap = bytesToString(memSwap);
+  }
+  const memReserve = Number(memoryReservation);
+  if (Number.isFinite(memReserve) && memReserve > 0) {
+    out.memoryReservation = bytesToString(memReserve);
+  }
+  const pids = Number(pidsLimit);
+  // PidsLimit is reported as 2048 by podman default — that's not
+  // actually a "set" value, it's the default. Only emit if very
+  // different. Detecting "this is the kernel default" precisely is
+  // hard; treat 0 and 2048 as unset.
+  if (Number.isFinite(pids) && pids > 0 && pids !== 2048) {
+    out.pidsLimit = pids;
+  }
+  const oom = Number(oomScoreAdj);
+  if (Number.isFinite(oom) && oom !== 0) {
+    out.oomScoreAdj = oom;
+  }
+
+  return out;
+}
+
+/**
+ * Convert a byte count back into the human form consumer plugins
+ * use ("512m", "2g"). Picks the largest unit that produces an
+ * integer result, falling back to bytes ("536870912b") if no clean
+ * unit fits — though this should not happen for typical container
+ * memory values which are always whole MiB.
+ */
+function bytesToString(bytes: number): string {
+  const G = 1024 * 1024 * 1024;
+  const M = 1024 * 1024;
+  const K = 1024;
+  if (bytes >= G && bytes % G === 0) return `${bytes / G}g`;
+  if (bytes >= M && bytes % M === 0) return `${bytes / M}m`;
+  if (bytes >= K && bytes % K === 0) return `${bytes / K}k`;
+  return `${bytes}b`;
+}
+
 function buildRunArgs(
   name: string,
   config: ContainerConfig,
@@ -158,7 +287,9 @@ function buildRunArgs(
   }
 
   // Resource limits (--cpus, --memory, --pids-limit, etc.)
-  args.push(...resourceFlagsForRun(config.resources));
+  // Fields whose backing cgroup controller is unavailable on this
+  // runtime are silently dropped.
+  args.push(...resourceFlagsForRun(config.resources, runtime));
 
   args.push(imageRef);
 

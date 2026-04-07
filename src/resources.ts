@@ -17,6 +17,88 @@ const LIVE_UPDATABLE_FIELDS: ReadonlyArray<keyof ContainerResourceLimits> = [
 ];
 
 /**
+ * Maps each ContainerResourceLimits field to the cgroup v2 controller
+ * it requires. `null` means the field is not gated by a cgroup
+ * controller (oom_score_adj is set in /proc/<pid>/oom_score_adj, not
+ * via cgroups). Used by `filterUnsupportedLimits` to gracefully drop
+ * limits whose backing controller is not delegated to the runtime.
+ */
+const FIELD_TO_CONTROLLER: Record<
+  keyof ContainerResourceLimits,
+  string | null
+> = {
+  cpus: "cpu",
+  cpuShares: "cpu",
+  cpusetCpus: "cpuset",
+  memory: "memory",
+  memorySwap: "memory",
+  memoryReservation: "memory",
+  pidsLimit: "pids",
+  oomScoreAdj: null, // not a cgroup controller
+};
+
+export interface FilterResult {
+  /** Limits with unsupported fields removed. */
+  accepted: ContainerResourceLimits;
+  /**
+   * Fields that were dropped, with the reason. Caller should log
+   * these once (not on every reconcile) so the user knows their
+   * override is being silently ignored.
+   */
+  dropped: Array<{ field: keyof ContainerResourceLimits; reason: string }>;
+}
+
+/**
+ * Drop ContainerResourceLimits fields whose backing cgroup controller
+ * is not available on this runtime. Returns the filtered limits and
+ * a list of dropped fields for logging.
+ *
+ * Behavior:
+ *   - If `runtime.cgroupControllers` is `null` or `undefined`, all
+ *     fields are accepted (we have no information to filter against —
+ *     this is the default for docker, where we don't probe).
+ *   - If a field is `null` or `undefined` in the input, it's preserved
+ *     (the merge layer handles null=unset semantics).
+ *   - If a field's controller is in the available list, accepted.
+ *   - If a field's controller is missing, dropped with a clear reason.
+ */
+export function filterUnsupportedLimits(
+  limits: ContainerResourceLimits,
+  runtime: ContainerRuntimeInfo,
+): FilterResult {
+  const controllers = runtime.cgroupControllers;
+  if (!controllers) {
+    // Not probed — assume all controllers are available.
+    return { accepted: { ...limits }, dropped: [] };
+  }
+  const available = new Set(controllers);
+  const accepted: ContainerResourceLimits = {};
+  const dropped: FilterResult["dropped"] = [];
+
+  for (const key of Object.keys(limits) as Array<
+    keyof ContainerResourceLimits
+  >) {
+    const value = limits[key];
+    // Preserve null/undefined verbatim — merge layer handles them.
+    if (value === undefined || value === null) {
+      (accepted as Record<string, unknown>)[key] = value as unknown;
+      continue;
+    }
+    const controller = FIELD_TO_CONTROLLER[key];
+    if (controller === null || available.has(controller)) {
+      (accepted as Record<string, unknown>)[key] = value;
+    } else {
+      dropped.push({
+        field: key,
+        reason: `cgroup controller '${controller}' not delegated to ${runtime.runtime} (available: ${controllers.join(", ") || "none"})`,
+      });
+    }
+  }
+
+  return { accepted, dropped };
+}
+
+/**
  * Field-level merge of two ContainerResourceLimits objects. The
  * override "wins" — but `null` in the override means "explicitly
  * remove the limit set by the base", whereas `undefined` means
@@ -73,39 +155,45 @@ function clean(limits: ContainerResourceLimits): ContainerResourceLimits {
  * Translate ContainerResourceLimits into podman/docker run flags.
  * Returns a flat array suitable for splicing into the run argv.
  * Ordering doesn't matter — both runtimes accept these in any order.
+ *
+ * Fields whose backing cgroup controller is unavailable on the host
+ * are silently dropped — caller should call `filterUnsupportedLimits`
+ * separately if it wants to log the dropped set.
  */
 export function resourceFlagsForRun(
   limits: ContainerResourceLimits | undefined,
+  runtime: ContainerRuntimeInfo,
 ): string[] {
   if (!limits) return [];
+  const { accepted } = filterUnsupportedLimits(limits, runtime);
   const args: string[] = [];
 
-  if (limits.cpus !== undefined && limits.cpus !== null) {
-    args.push("--cpus", String(limits.cpus));
+  if (accepted.cpus !== undefined && accepted.cpus !== null) {
+    args.push("--cpus", String(accepted.cpus));
   }
-  if (limits.cpuShares !== undefined && limits.cpuShares !== null) {
-    args.push("--cpu-shares", String(limits.cpuShares));
+  if (accepted.cpuShares !== undefined && accepted.cpuShares !== null) {
+    args.push("--cpu-shares", String(accepted.cpuShares));
   }
-  if (limits.cpusetCpus !== undefined && limits.cpusetCpus !== null) {
-    args.push("--cpuset-cpus", limits.cpusetCpus);
+  if (accepted.cpusetCpus !== undefined && accepted.cpusetCpus !== null) {
+    args.push("--cpuset-cpus", accepted.cpusetCpus);
   }
-  if (limits.memory !== undefined && limits.memory !== null) {
-    args.push("--memory", limits.memory);
+  if (accepted.memory !== undefined && accepted.memory !== null) {
+    args.push("--memory", accepted.memory);
   }
-  if (limits.memorySwap !== undefined && limits.memorySwap !== null) {
-    args.push("--memory-swap", limits.memorySwap);
+  if (accepted.memorySwap !== undefined && accepted.memorySwap !== null) {
+    args.push("--memory-swap", accepted.memorySwap);
   }
   if (
-    limits.memoryReservation !== undefined &&
-    limits.memoryReservation !== null
+    accepted.memoryReservation !== undefined &&
+    accepted.memoryReservation !== null
   ) {
-    args.push("--memory-reservation", limits.memoryReservation);
+    args.push("--memory-reservation", accepted.memoryReservation);
   }
-  if (limits.pidsLimit !== undefined && limits.pidsLimit !== null) {
-    args.push("--pids-limit", String(limits.pidsLimit));
+  if (accepted.pidsLimit !== undefined && accepted.pidsLimit !== null) {
+    args.push("--pids-limit", String(accepted.pidsLimit));
   }
-  if (limits.oomScoreAdj !== undefined && limits.oomScoreAdj !== null) {
-    args.push("--oom-score-adj", String(limits.oomScoreAdj));
+  if (accepted.oomScoreAdj !== undefined && accepted.oomScoreAdj !== null) {
+    args.push("--oom-score-adj", String(accepted.oomScoreAdj));
   }
 
   return args;
@@ -169,11 +257,24 @@ export type ExecRuntimeFn = (
 
 /**
  * Attempt a live `podman update` / `docker update` on the named
- * container. Returns true on success, false on any failure (caller
- * is expected to fall back to recreate).
+ * container. Returns ok=true on success, ok=false on any failure
+ * (caller is expected to fall back to recreate).
  *
  * The container name should already be the prefixed form (sk-...).
  * `exec` defaults to the production execRuntime; tests pass a stub.
+ *
+ * Behavior:
+ *   - Filters `limits` against `runtime.cgroupControllers` first.
+ *     Fields whose backing controller is unavailable are dropped
+ *     silently (caller logs them via filterUnsupportedLimits if it
+ *     wants visibility).
+ *   - If the filtered limits contain a field that cannot be
+ *     live-updated (e.g. cpuset, oomScoreAdj), returns ok=false so
+ *     the caller falls back to recreate.
+ *   - If the filtered limits are empty (every field was dropped),
+ *     verifies the container exists before claiming vacuous success.
+ *     This prevents Bug C: silent success when the container has
+ *     been removed out from under us.
  */
 export async function tryLiveUpdate(
   runtime: ContainerRuntimeInfo,
@@ -181,12 +282,22 @@ export async function tryLiveUpdate(
   limits: ContainerResourceLimits,
   exec: ExecRuntimeFn = execRuntime,
 ): Promise<{ ok: boolean; stderr?: string }> {
-  const flags = resourceFlagsForUpdate(limits);
+  const { accepted } = filterUnsupportedLimits(limits, runtime);
+  const flags = resourceFlagsForUpdate(accepted);
   if (flags === null) {
     return { ok: false, stderr: "limits contain non-live-updatable fields" };
   }
   if (flags.length === 0) {
-    // Nothing to apply — vacuously successful.
+    // Nothing to apply via update. Don't claim vacuous success
+    // without verifying the target exists — the caller may be
+    // operating on a container that was removed out from under us.
+    const exists = await exec(runtime, ["inspect", fullName]);
+    if (exists.exitCode !== 0) {
+      return {
+        ok: false,
+        stderr: `container ${fullName} does not exist`,
+      };
+    }
     return { ok: true };
   }
   const result = await exec(runtime, ["update", ...flags, fullName]);
