@@ -6,12 +6,19 @@ import {
   ContainerJobConfig,
   ContainerJobResult,
   ContainerManagerApi,
+  ContainerResourceLimits,
   ContainerRuntimeInfo,
   ContainerState,
   HealthCheckOptions,
   PluginConfig,
   PruneResult,
+  UpdateResourcesResult,
 } from "./types";
+import {
+  mergeResourceLimits,
+  resourceLimitsEqual,
+  tryLiveUpdate,
+} from "./resources";
 import { detectRuntime, isContainerized } from "./runtime";
 import {
   connectToNetwork,
@@ -52,6 +59,22 @@ module.exports = (app: App) => {
   const healthTimers = new Map<string, NodeJS.Timeout>();
   let updateService: UpdateService | null = null;
 
+  /**
+   * Per-container state for resource limit management:
+   *   lastConfigs        — the most recent ContainerConfig passed to
+   *                        ensureRunning(), used to recreate the
+   *                        container when a live `update` fails.
+   *   currentOverrides   — user overrides loaded from plugin config,
+   *                        keyed by the unprefixed container name.
+   *   effectiveResources — the merged limits currently applied
+   *                        (plugin default ⊕ user override). Used to
+   *                        skip no-op updates and report via
+   *                        getResources().
+   */
+  const lastConfigs = new Map<string, ContainerConfig>();
+  let currentOverrides: Record<string, ContainerResourceLimits> = {};
+  const effectiveResources = new Map<string, ContainerResourceLimits>();
+
   const api: ContainerManagerApi = {
     getRuntime() {
       return runtimeInfo;
@@ -85,10 +108,27 @@ module.exports = (app: App) => {
       options?: HealthCheckOptions,
     ) {
       if (!runtimeInfo) throw new Error("No container runtime available");
+
+      // Merge user override on top of the plugin's default resources.
+      // The user override (from signalk-container's own plugin config)
+      // wins field-by-field; null in the override removes a limit.
+      const merged = mergeResourceLimits(
+        config.resources,
+        currentOverrides[name],
+      );
+      const effectiveConfig: ContainerConfig = {
+        ...config,
+        resources: merged,
+      };
+
+      // Cache for later updateResources() recreate-fallback path.
+      lastConfigs.set(name, effectiveConfig);
+      effectiveResources.set(name, merged);
+
       await ensureRunning(
         runtimeInfo,
         name,
-        config,
+        effectiveConfig,
         (msg) => app.debug(msg),
         options,
       );
@@ -174,6 +214,71 @@ module.exports = (app: App) => {
       await disconnectFromNetwork(runtimeInfo, containerName, networkName);
     },
 
+    async updateResources(
+      name: string,
+      limits: ContainerResourceLimits,
+    ): Promise<UpdateResourcesResult> {
+      if (!runtimeInfo) throw new Error("No container runtime available");
+
+      const fullName = name.startsWith("sk-") ? name : `sk-${name}`;
+      const previous = effectiveResources.get(name) ?? {};
+
+      // No-op when nothing actually changes.
+      if (resourceLimitsEqual(previous, limits)) {
+        return { method: "live" };
+      }
+
+      // Try the runtime's live `update` first — instantaneous, no
+      // downtime — and only fall back to recreate when it refuses.
+      const live = await tryLiveUpdate(runtimeInfo, fullName, limits);
+      if (live.ok) {
+        effectiveResources.set(name, { ...limits });
+        // Also keep the cached ContainerConfig in sync so that a
+        // future recreate (e.g. on plugin restart) preserves the
+        // newer limits.
+        const cached = lastConfigs.get(name);
+        if (cached) {
+          lastConfigs.set(name, { ...cached, resources: { ...limits } });
+        }
+        return { method: "live" };
+      }
+
+      // Live update refused (cpuset on incompatible kernel, oom-score-adj,
+      // or runtime quirk). Fall back to stop+remove+ensureRunning if we
+      // have the original config cached.
+      const cached = lastConfigs.get(name);
+      if (!cached) {
+        throw new Error(
+          `updateResources: cannot recreate ${name} — no cached ContainerConfig. ` +
+            `Live update failed: ${live.stderr ?? "unknown reason"}. ` +
+            `The consumer plugin must call ensureRunning() first.`,
+        );
+      }
+
+      const warnings = live.stderr ? [`live update: ${live.stderr}`] : [];
+      const newConfig: ContainerConfig = {
+        ...cached,
+        resources: { ...limits },
+      };
+      try {
+        await removeContainer(runtimeInfo, name);
+      } catch (err) {
+        warnings.push(
+          `remove during recreate: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      await ensureRunning(runtimeInfo, name, newConfig, (msg) =>
+        app.debug(msg),
+      );
+      lastConfigs.set(name, newConfig);
+      effectiveResources.set(name, { ...limits });
+      return { method: "recreated", warnings };
+    },
+
+    getResources(name: string): ContainerResourceLimits {
+      return { ...(effectiveResources.get(name) ?? {}) };
+    },
+
     // `updates` is wired up in start() once the data dir is known.
     // Until then, register() is a silent no-op via the stub below.
     get updates() {
@@ -256,10 +361,59 @@ module.exports = (app: App) => {
           description:
             "Periodically check for container image updates in the background. Disable on metered connections — manual checks via the UI button still work.",
         },
+        containerOverrides: {
+          type: "object" as const,
+          title: "Per-container resource overrides",
+          description:
+            'Override resource limits for specific managed containers, keyed by name (without \'sk-\' prefix). Field-level merged on top of the consumer plugin\'s defaults — set a field to null to remove a limit set by the plugin. Example: { "mayara-server": { "cpus": 1.5, "memory": "512m" } }. Live-applied via \'podman update\' when possible, falls back to recreate.',
+          additionalProperties: {
+            type: "object",
+            properties: {
+              cpus: { type: ["number", "null"], title: "Hard CPU cap (cores)" },
+              cpuShares: {
+                type: ["number", "null"],
+                title: "Soft CPU weight (default 1024)",
+              },
+              cpusetCpus: {
+                type: ["string", "null"],
+                title: "Pin to specific cores, e.g. '0,1' or '1-3'",
+              },
+              memory: {
+                type: ["string", "null"],
+                title: "Hard memory cap, e.g. '512m', '2g'",
+              },
+              memorySwap: {
+                type: ["string", "null"],
+                title: "Memory + swap (set equal to 'memory' to disable swap)",
+              },
+              memoryReservation: {
+                type: ["string", "null"],
+                title: "Soft memory floor",
+              },
+              pidsLimit: {
+                type: ["number", "null"],
+                title: "Process/thread cap",
+              },
+              oomScoreAdj: {
+                type: ["number", "null"],
+                title: "OOM score adjustment (-1000..1000)",
+              },
+            },
+          },
+          default: {},
+        },
       },
     },
 
     start(config: PluginConfig) {
+      // Cache user-supplied per-container resource overrides. These
+      // are merged into every ensureRunning() call so consumer
+      // plugins automatically pick them up. The user can edit them
+      // in signalk-container's plugin config; saving causes Signal K
+      // to stop+start this plugin, so the new overrides take effect
+      // on the next ensureRunning() call from each consumer.
+      currentOverrides = config.containerOverrides ?? {};
+
       // Instantiate the update service synchronously so consumer
       // plugins can call containers.updates.register(...) before
       // the runtime is detected. The service tolerates a null
@@ -380,6 +534,9 @@ module.exports = (app: App) => {
         updateService.stop();
         updateService = null;
       }
+      lastConfigs.clear();
+      effectiveResources.clear();
+      currentOverrides = {};
       delete (globalThis as any).__signalk_containerManager;
     },
 
@@ -405,8 +562,38 @@ module.exports = (app: App) => {
 
       router.get("/api/containers/:name/state", async (req, res) => {
         try {
-          const state = await api.getState(req.params.name);
+          const state = await api.getState(String(req.params.name));
           res.json({ name: req.params.name, state });
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+          });
+        }
+      });
+
+      router.get("/api/containers/:name/resources", (req, res) => {
+        if (!runtimeInfo) {
+          res.status(503).json({ error: "No container runtime available" });
+          return;
+        }
+        const name = String(req.params.name);
+        res.json({
+          name,
+          effective: api.getResources(name),
+          override: currentOverrides[name] ?? null,
+        });
+      });
+
+      router.post("/api/containers/:name/resources", async (req, res) => {
+        if (!runtimeInfo) {
+          res.status(503).json({ error: "No container runtime available" });
+          return;
+        }
+        const name = String(req.params.name);
+        const limits = (req.body ?? {}) as ContainerResourceLimits;
+        try {
+          const result = await api.updateResources(name, limits);
+          res.json({ name, ...result, effective: api.getResources(name) });
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : "Unknown error",

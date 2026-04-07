@@ -10,6 +10,7 @@ Instead of each plugin implementing its own container orchestration, they delega
 - **Container lifecycle** -- pull, create, start, stop, remove with `sk-` prefix naming
 - **One-shot jobs** -- run containers for batch tasks (export, conversion, etc.)
 - **Update detection** -- centralized "is there a newer image?" service for all consumer plugins. Auto-detects semver vs floating tags (`:latest`, `:main`), offline-tolerant with persistent cache, emits Signal K notifications. See the [developer guide](doc/plugin-developer-guide.md#update-detection).
+- **Resource limits** -- per-container CPU/memory/PID caps so a runaway container can't take down the boat. Consumer plugin sets sensible defaults; user can override per-container in this plugin's config. Live-applied via `podman update` when possible, falls back to recreate. See the [developer guide](doc/plugin-developer-guide.md#resource-limits).
 - **Image management** -- scheduled pruning of dangling images (weekly/monthly)
 - **SELinux support** -- `:Z` volume flags for Podman on Fedora/RHEL
 - **Podman image qualification** -- automatically prefixes `docker.io/` for short image names
@@ -84,23 +85,27 @@ See [doc/plugin-developer-guide.md](doc/plugin-developer-guide.md) for the full 
 | `updates.unregister(pluginId)`          | Stop tracking updates for a plugin                           |
 | `updates.checkOne(pluginId)`            | Force a fresh update check (or coalesce with in-flight)      |
 | `updates.getLastResult(pluginId)`       | Cached last result, no network                               |
+| `updateResources(name, limits)`         | Apply new resource limits live, fall back to recreate        |
+| `getResources(name)`                    | Currently effective limits (plugin defaults ⊕ user override) |
 
 ## REST Endpoints
 
 All mounted at `/plugins/signalk-container/api/`:
 
-| Method | Path                       | Description                                             |
-| ------ | -------------------------- | ------------------------------------------------------- |
-| GET    | `/runtime`                 | Detected runtime info                                   |
-| GET    | `/containers`              | List managed containers                                 |
-| GET    | `/containers/:name/state`  | Container state                                         |
-| POST   | `/containers/:name/start`  | Start a stopped container                               |
-| POST   | `/containers/:name/stop`   | Stop a running container                                |
-| POST   | `/containers/:name/remove` | Stop and remove a container                             |
-| POST   | `/prune`                   | Prune dangling images                                   |
-| GET    | `/updates`                 | List last update-check results                          |
-| GET    | `/updates/:pluginId`       | Last update-check result for one plugin                 |
-| POST   | `/updates/:pluginId/check` | Force a fresh update check (HTTP 200 even when offline) |
+| Method | Path                          | Description                                             |
+| ------ | ----------------------------- | ------------------------------------------------------- |
+| GET    | `/runtime`                    | Detected runtime info                                   |
+| GET    | `/containers`                 | List managed containers                                 |
+| GET    | `/containers/:name/state`     | Container state                                         |
+| POST   | `/containers/:name/start`     | Start a stopped container                               |
+| POST   | `/containers/:name/stop`      | Stop a running container                                |
+| POST   | `/containers/:name/remove`    | Stop and remove a container                             |
+| POST   | `/prune`                      | Prune dangling images                                   |
+| GET    | `/updates`                    | List last update-check results                          |
+| GET    | `/updates/:pluginId`          | Last update-check result for one plugin                 |
+| POST   | `/updates/:pluginId/check`    | Force a fresh update check (HTTP 200 even when offline) |
+| GET    | `/containers/:name/resources` | Effective resource limits + user override               |
+| POST   | `/containers/:name/resources` | Apply new resource limits (live or recreate)            |
 
 ## Configuration
 
@@ -111,6 +116,7 @@ All mounted at `/plugins/signalk-container/api/`:
 | Max concurrent jobs      | `2`      | Limit parallel one-shot job executions                                                                                         |
 | Update check interval    | `24h`    | How often to check for container image updates (e.g. `24h`, `12h`, `1h`). Min 1h.                                              |
 | Background update checks | `true`   | Periodically check for updates in the background. Disable on metered connections — manual checks via the UI button still work. |
+| Container overrides      | `{}`     | Per-container resource limits (CPU, memory, PIDs). Field-level merged on top of consumer plugin defaults. See dev guide.       |
 
 ## Requirements
 

@@ -6,6 +6,7 @@ import {
   HealthCheckOptions,
 } from "./types";
 import { execRuntime, execRuntimeLong } from "./runtime";
+import { resourceFlagsForRun } from "./resources";
 
 const CONTAINER_PREFIX = "sk-";
 
@@ -155,6 +156,9 @@ function buildRunArgs(
       args.push("-e", `${key}=${value}`);
     }
   }
+
+  // Resource limits (--cpus, --memory, --pids-limit, etc.)
+  args.push(...resourceFlagsForRun(config.resources));
 
   args.push(imageRef);
 

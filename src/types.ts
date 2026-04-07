@@ -18,6 +18,46 @@ export interface ContainerConfig {
   restart?: "no" | "unless-stopped" | "always";
   command?: string[];
   networkMode?: string;
+  /**
+   * Resource limits for the container. The consumer plugin sets a
+   * sensible default here; the user can override per-container via
+   * signalk-container's plugin config (see `containerOverrides`).
+   * The user override is field-level merged on top of the plugin
+   * default — set a field to `null` to explicitly remove the limit.
+   */
+  resources?: ContainerResourceLimits;
+}
+
+/**
+ * Resource limits applied via podman/docker run flags. All fields
+ * are optional; omitted means "no limit imposed by us" (the runtime
+ * default applies). Use `null` in a user override to explicitly
+ * remove a limit set by the plugin default.
+ *
+ * For semantics see:
+ *   https://docs.podman.io/en/latest/markdown/podman-run.1.html#cpu-options
+ *   https://docs.podman.io/en/latest/markdown/podman-run.1.html#memory-options
+ */
+export interface ContainerResourceLimits {
+  /** Hard CPU cap (CFS quota). e.g. 1.5 = 1.5 cores. */
+  cpus?: number | null;
+  /** Soft CPU weight under contention. Default 1024. */
+  cpuShares?: number | null;
+  /** Pin to specific cores. e.g. "0,1" or "1-3". */
+  cpusetCpus?: string | null;
+  /** Hard memory cap, e.g. "512m", "2g". */
+  memory?: string | null;
+  /**
+   * Total memory + swap. Set equal to `memory` to disable swap entirely.
+   * Recommended for predictable behavior.
+   */
+  memorySwap?: string | null;
+  /** Soft floor — kernel reclaims first from containers above this. */
+  memoryReservation?: string | null;
+  /** Process/thread cap to bound runaway thread leaks. */
+  pidsLimit?: number | null;
+  /** OOM score adjustment, -1000..1000. Higher = killed first. */
+  oomScoreAdj?: number | null;
 }
 
 export interface ContainerInfo {
@@ -82,6 +122,24 @@ export interface ContainerManagerApi {
    * service for floating-tag drift checks.
    */
   getImageDigest(imageOrContainer: string): Promise<string | null>;
+  /**
+   * Apply new resource limits to a running container. Tries the
+   * runtime's live `update` command first (no downtime); falls back
+   * to stop+remove+ensureRunning if the runtime can't apply them
+   * live (e.g. cpuset on some kernels). The container's effective
+   * limits become the field-level merge of `limits` on top of the
+   * config last passed to `ensureRunning`.
+   */
+  updateResources(
+    name: string,
+    limits: ContainerResourceLimits,
+  ): Promise<UpdateResourcesResult>;
+  /**
+   * Return the currently effective resource limits for a managed
+   * container, merging plugin defaults and user overrides. Returns
+   * an empty object if the container has no limits or doesn't exist.
+   */
+  getResources(name: string): ContainerResourceLimits;
   ensureRunning(
     name: string,
     config: ContainerConfig,
@@ -120,4 +178,21 @@ export interface PluginConfig {
   maxConcurrentJobs: number;
   updateCheckInterval?: string;
   backgroundUpdateChecks?: boolean;
+  /**
+   * Per-container user overrides for resource limits, keyed by
+   * container name (without `sk-` prefix). Field-level merged on top
+   * of the plugin's default. Use `null` to explicitly remove a limit
+   * set by the plugin.
+   */
+  containerOverrides?: Record<string, ContainerResourceLimits>;
+}
+
+/**
+ * Result of an updateResources() call. `live` means cgroup limits
+ * were applied without restart; `recreated` means we fell back to
+ * stop+remove+create because the runtime refused the live update.
+ */
+export interface UpdateResourcesResult {
+  method: "live" | "recreated";
+  warnings?: string[];
 }

@@ -458,6 +458,93 @@ When a check transitions from "up-to-date" to "update-available", the service em
 
 ---
 
+## Resource Limits
+
+A boat at sea typically runs Signal K plus several containers (questdb, grafana, mayara, etc.) on a Raspberry Pi or low-power x86 mini PC. One container hogging CPU or leaking memory can starve Signal K's event loop, raise NMEA decode latency, trigger thermal throttling, or even OOM-kill the host.
+
+signalk-container exposes podman/docker resource flags through a `resources` field on `ContainerConfig`. You set sensible defaults; the user can override per-container in signalk-container's plugin config. Field-level merge — the user override wins on a per-field basis.
+
+### Setting defaults from your plugin
+
+```typescript
+await containers.ensureRunning("mayara-server", {
+  image: "ghcr.io/marineyachtradar/mayara-server",
+  tag: "latest",
+  networkMode: "host",
+  restart: "unless-stopped",
+  resources: {
+    cpus: 1.5, // hard cap at 1.5 cores
+    memory: "512m", // hard memory cap
+    memorySwap: "512m", // = memory → swap disabled
+    pidsLimit: 200, // bound thread leaks
+  },
+});
+```
+
+The defaults you pick should reflect what your container actually needs at typical workload, with maybe 25% headroom. Don't be conservative to the point of starvation, but don't leave it unlimited either — that defeats the purpose.
+
+### What each field maps to
+
+| Field               | Runtime flag           | Use case                                                                                                                   |
+| ------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `cpus`              | `--cpus`               | Hard CPU cap via CFS quota. e.g. `1.5` = 1.5 cores. **The most important field for stability.**                            |
+| `cpuShares`         | `--cpu-shares`         | Soft weight (default 1024). Only matters under contention. Use to set priority between containers.                         |
+| `cpusetCpus`        | `--cpuset-cpus`        | Pin to specific cores, e.g. `"1,2"`. Useful for "keep mayara off core 0 where Signal K runs".                              |
+| `memory`            | `--memory`             | Hard memory cap. Container is OOM-killed if it exceeds this. **Critical for OS stability.**                                |
+| `memorySwap`        | `--memory-swap`        | Total memory + swap. Set equal to `memory` to disable swap entirely. Recommended for predictability.                       |
+| `memoryReservation` | `--memory-reservation` | Soft floor — kernel reclaims first from containers above this when host is under memory pressure.                          |
+| `pidsLimit`         | `--pids-limit`         | Process/thread cap. Prevents fork bombs and runaway thread leaks.                                                          |
+| `oomScoreAdj`       | `--oom-score-adj`      | OOM score adjustment, -1000..1000. Higher = killed first under host OOM. Set high on "I'd rather lose this than Signal K". |
+
+### User overrides via signalk-container config
+
+The user can override your defaults in signalk-container's plugin config UI under "Per-container resource overrides". The override is keyed by container name (without `sk-` prefix) and field-level merged on top of your default.
+
+Example: your plugin defaults `cpus: 1.5, memory: "512m"`. The user sets `{ "mayara-server": { "cpus": 2.0 } }`. The effective limits become `{ cpus: 2.0, memory: "512m" }` — the user bumped CPU without having to know your memory default.
+
+To **explicitly remove** a limit your plugin set, the user uses `null`:
+
+```json
+{ "mayara-server": { "memory": null } }
+```
+
+This results in effective limits `{ cpus: 1.5 }` — no memory cap.
+
+### Live updates without restart
+
+When the user changes overrides and saves, signalk-container restarts (Signal K stops + starts the plugin on config save), so the new merged limits apply on the next `ensureRunning()` call from your plugin. For changes to **already-running** containers, your plugin (or a UI) can call:
+
+```typescript
+const result = await containers.updateResources("mayara-server", {
+  cpus: 2.0,
+  memory: "1g",
+});
+console.log(result.method); // "live" or "recreated"
+```
+
+The service tries `podman update` (or `docker update`) first — instantaneous, no downtime. If the runtime refuses (cpuset on some kernels, oom-score-adj which is set at create time only, etc.), it falls back to stop+remove+ensureRunning with the new limits. The cached `ContainerConfig` from the original `ensureRunning` call is reused, so port mappings, env vars, and volumes are preserved automatically.
+
+`result.method` tells you which path was taken. `result.warnings` may contain a message explaining why live update failed if a recreate happened.
+
+### Reading the effective limits
+
+```typescript
+const effective = containers.getResources("mayara-server");
+// → { cpus: 2.0, memory: "512m", pidsLimit: 200 } — merged result
+```
+
+This is the same data exposed via `GET /plugins/signalk-container/api/containers/:name/resources`, which also includes the raw user override under the `override` key.
+
+### Critical rules
+
+1. **Always set sensible defaults.** Unlimited containers are a stability hazard on a boat.
+2. **`memorySwap` = `memory` is almost always what you want.** Swap on a Pi or eMMC is slow and unpredictable; better to OOM-kill the offending container quickly than to thrash.
+3. **Don't pin to core 0 by default** (`cpusetCpus: "0"`). Signal K's event loop usually lives there.
+4. **`updateResources` is callable any time** but the cached config used for recreate fallback comes from your most recent `ensureRunning()` call. If you've never called `ensureRunning`, recreate will throw with a clear error.
+5. **`cpuset-cpus` and `oom-score-adj` cannot be live-updated.** Setting either forces the recreate fallback.
+
+---
+
 ## TypeScript Types
 
 If you want type safety, define a minimal interface in your plugin:
@@ -478,6 +565,11 @@ interface ContainerManagerApi {
   ) => Promise<void>;
   imageExists: (image: string) => Promise<boolean>;
   getImageDigest: (imageOrContainer: string) => Promise<string | null>;
+  updateResources: (
+    name: string,
+    limits: unknown,
+  ) => Promise<{ method: "live" | "recreated"; warnings?: string[] }>;
+  getResources: (name: string) => unknown;
   runJob: (
     config: unknown,
   ) => Promise<{ status: string; exitCode?: number; log: string[] }>;
