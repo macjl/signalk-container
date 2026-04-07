@@ -44,6 +44,46 @@ export async function imageExists(
   return result.exitCode === 0;
 }
 
+/**
+ * Return the local image ID (sha256 digest) for a given image reference,
+ * or null if the image is not present locally. Used for digest-drift
+ * detection of floating tags like :latest or :main.
+ *
+ * Pass either a repo:tag (e.g. "questdb/questdb:latest") to inspect a
+ * pulled image, or a container name to inspect the image a running
+ * container is using.
+ */
+export async function getImageDigest(
+  runtime: ContainerRuntimeInfo,
+  imageOrContainer: string,
+): Promise<string | null> {
+  // Try image inspect first; fall back to container inspect for names.
+  const qualified = qualifyImage(imageOrContainer, runtime);
+  const imgResult = await execRuntime(runtime, [
+    "image",
+    "inspect",
+    "--format",
+    "{{.Id}}",
+    qualified,
+  ]);
+  if (imgResult.exitCode === 0 && imgResult.stdout) {
+    return imgResult.stdout.trim();
+  }
+
+  // Maybe it's a container name; .Image on a container returns the image ID.
+  const ctrResult = await execRuntime(runtime, [
+    "inspect",
+    "--format",
+    "{{.Image}}",
+    imageOrContainer,
+  ]);
+  if (ctrResult.exitCode === 0 && ctrResult.stdout) {
+    return ctrResult.stdout.trim();
+  }
+
+  return null;
+}
+
 export async function pullImage(
   runtime: ContainerRuntimeInfo,
   image: string,

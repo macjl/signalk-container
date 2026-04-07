@@ -9,6 +9,7 @@ Instead of each plugin implementing its own container orchestration, they delega
 - **Runtime detection** -- Podman preferred, Docker fallback, podman-shim aware
 - **Container lifecycle** -- pull, create, start, stop, remove with `sk-` prefix naming
 - **One-shot jobs** -- run containers for batch tasks (export, conversion, etc.)
+- **Update detection** -- centralized "is there a newer image?" service for all consumer plugins. Auto-detects semver vs floating tags (`:latest`, `:main`), offline-tolerant with persistent cache, emits Signal K notifications. See the [developer guide](doc/plugin-developer-guide.md#update-detection).
 - **Image management** -- scheduled pruning of dangling images (weekly/monthly)
 - **SELinux support** -- `:Z` volume flags for Podman on Fedora/RHEL
 - **Podman image qualification** -- automatically prefixes `docker.io/` for short image names
@@ -65,6 +66,7 @@ See [doc/plugin-developer-guide.md](doc/plugin-developer-guide.md) for the full 
 | `getRuntime()`                          | Returns `{ runtime, version, isPodmanDockerShim }` or `null` |
 | `pullImage(image, onProgress?)`         | Pull a container image (auto-qualifies for Podman)           |
 | `imageExists(image)`                    | Check if image exists locally                                |
+| `getImageDigest(imageOrContainer)`      | Local image ID (sha256) for an image:tag or container        |
 | `ensureRunning(name, config, options?)` | Create and start container if not running                    |
 | `start(name)`                           | Start a stopped container                                    |
 | `stop(name)`                            | Stop a running container                                     |
@@ -78,28 +80,37 @@ See [doc/plugin-developer-guide.md](doc/plugin-developer-guide.md) for the full 
 | `removeNetwork(name)`                   | Remove a network                                             |
 | `connectToNetwork(container, network)`  | Add a container to a network (bridge mode only)              |
 | `disconnectFromNetwork(container, net)` | Remove a container from a network                            |
+| `updates.register(reg)`                 | Register a container for update detection                    |
+| `updates.unregister(pluginId)`          | Stop tracking updates for a plugin                           |
+| `updates.checkOne(pluginId)`            | Force a fresh update check (or coalesce with in-flight)      |
+| `updates.getLastResult(pluginId)`       | Cached last result, no network                               |
 
 ## REST Endpoints
 
 All mounted at `/plugins/signalk-container/api/`:
 
-| Method | Path                       | Description                 |
-| ------ | -------------------------- | --------------------------- |
-| GET    | `/runtime`                 | Detected runtime info       |
-| GET    | `/containers`              | List managed containers     |
-| GET    | `/containers/:name/state`  | Container state             |
-| POST   | `/containers/:name/start`  | Start a stopped container   |
-| POST   | `/containers/:name/stop`   | Stop a running container    |
-| POST   | `/containers/:name/remove` | Stop and remove a container |
-| POST   | `/prune`                   | Prune dangling images       |
+| Method | Path                       | Description                                             |
+| ------ | -------------------------- | ------------------------------------------------------- |
+| GET    | `/runtime`                 | Detected runtime info                                   |
+| GET    | `/containers`              | List managed containers                                 |
+| GET    | `/containers/:name/state`  | Container state                                         |
+| POST   | `/containers/:name/start`  | Start a stopped container                               |
+| POST   | `/containers/:name/stop`   | Stop a running container                                |
+| POST   | `/containers/:name/remove` | Stop and remove a container                             |
+| POST   | `/prune`                   | Prune dangling images                                   |
+| GET    | `/updates`                 | List last update-check results                          |
+| GET    | `/updates/:pluginId`       | Last update-check result for one plugin                 |
+| POST   | `/updates/:pluginId/check` | Force a fresh update check (HTTP 200 even when offline) |
 
 ## Configuration
 
-| Setting             | Default  | Description                             |
-| ------------------- | -------- | --------------------------------------- |
-| Preferred runtime   | `auto`   | Auto-detect, or force `podman`/`docker` |
-| Auto-prune images   | `weekly` | `off`, `weekly`, or `monthly`           |
-| Max concurrent jobs | `2`      | Limit parallel one-shot job executions  |
+| Setting                  | Default  | Description                                                                                                                    |
+| ------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Preferred runtime        | `auto`   | Auto-detect, or force `podman`/`docker`                                                                                        |
+| Auto-prune images        | `weekly` | `off`, `weekly`, or `monthly`                                                                                                  |
+| Max concurrent jobs      | `2`      | Limit parallel one-shot job executions                                                                                         |
+| Update check interval    | `24h`    | How often to check for container image updates (e.g. `24h`, `12h`, `1h`). Min 1h.                                              |
+| Background update checks | `true`   | Periodically check for updates in the background. Disable on metered connections — manual checks via the UI button still work. |
 
 ## Requirements
 

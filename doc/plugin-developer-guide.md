@@ -324,6 +324,138 @@ Removes dangling images.
 
 Lists all `sk-` prefixed containers.
 
+### `getImageDigest(imageOrContainer): Promise<string | null>`
+
+Returns the local image ID (sha256 digest) for an image reference or container name. Returns `null` if not present locally. Used internally by the update detection service for floating-tag drift checks, but exposed to plugins that want to do their own digest comparison.
+
+---
+
+## Update Detection
+
+signalk-container ships a centralized update detection service. Instead of each plugin re-implementing "is there a newer image for my container?", you register your container once and the service handles version checking, scheduling, caching, offline tolerance, and Signal K notifications.
+
+The service is detection-only — it tells you when an update is available. **Applying the update remains the consumer plugin's responsibility** because each plugin has its own ContainerConfig (ports, env, volumes, conditional flags) and post-apply glue (reconnecting clients, persisting config, etc.) that signalk-container can't know about.
+
+### Basic registration
+
+Inside your plugin's `start()`, after the container is up and runtime is ready:
+
+```typescript
+containers.updates.register({
+  pluginId: "signalk-questdb",
+  containerName: "signalk-questdb",
+  image: "questdb/questdb",
+  // MUST be a function (not a captured value): the user can edit
+  // the version in plugin options without re-registering.
+  currentTag: () => currentConfig?.questdbVersion ?? "latest",
+  versionSource: containers.updates.sources.githubReleases("questdb/questdb"),
+  // Optional: query the running container for its version directly.
+  // If present and returns non-null, takes precedence over currentTag.
+  currentVersion: async () => {
+    const r = await queryClient.exec("SELECT build()");
+    return (
+      r.dataset[0]?.[0]?.toString().match(/QuestDB\s+([\d.]+)/)?.[1] ?? null
+    );
+  },
+});
+```
+
+In your plugin's `stop()`:
+
+```typescript
+containers.updates.unregister("signalk-questdb");
+```
+
+### Floating tags are handled automatically
+
+The service classifies the running tag and picks the right strategy:
+
+| Tag                                                 | Classification | Strategy                                                          |
+| --------------------------------------------------- | -------------- | ----------------------------------------------------------------- |
+| `9.2.0`, `v1.5`, `2.0.0-beta1`                      | semver         | Compare against `versionSource.latest` via semver                 |
+| `latest`, `main`, `master`, `nightly`, `edge`, `v3` | floating       | Pull image, compare local digest to remote digest                 |
+| `my-fork`, `custom-2024`                            | unknown        | Same as floating: digest drift only, never claims "newer-version" |
+
+You don't choose between strategies — you just pass `currentTag` and `versionSource`, and the service does the right thing whether the user pinned `9.2.0` or `latest` or `main`. For floating tags, "update available" means "the registry rebuilt the image" rather than "there's a newer version number". The `latestVersion` field in the result still reflects the latest stable semver release, so the UI can display "you're on `:main`, latest stable is 9.2.0" as informational context.
+
+### Reading the result
+
+The service exposes three accessor methods:
+
+```typescript
+// Cached, no network: cheap, safe to call from polling endpoints.
+const result = containers.updates.getLastResult("signalk-questdb");
+
+// Force a fresh check now (or coalesces with an in-flight check).
+const fresh = await containers.updates.checkOne("signalk-questdb");
+```
+
+`UpdateCheckResult` has these fields:
+
+```typescript
+{
+  pluginId: "signalk-questdb",
+  containerName: "signalk-questdb",
+  runningTag: "9.1.0",
+  tagKind: "semver",         // "semver" | "floating" | "unknown"
+  currentVersion: "9.1.0",   // null if cannot resolve
+  latestVersion: "9.2.0",    // null if version source returned no data
+  updateAvailable: true,
+  reason: "newer-version",   // "newer-version" | "digest-drift" | "up-to-date" | "offline" | "unknown" | "error"
+  checkedAt: "2026-04-08T12:00:00.000Z",
+  lastSuccessfulCheckAt: "2026-04-08T12:00:00.000Z",
+  fromCache: false,          // true when reason is "offline" and we returned cached data
+}
+```
+
+### Replacing an existing update endpoint
+
+If your plugin already exposes `/api/update/check`, you can keep the same URL and just delegate. This means **your config panel UI doesn't need to change**:
+
+```typescript
+router.get("/api/update/check", async (_req, res) => {
+  const result = await containers.updates.checkOne("signalk-questdb");
+  res.json({
+    currentVersion: result.currentVersion ?? "unknown",
+    latestVersion: result.latestVersion ?? "unknown",
+    updateAvailable: result.updateAvailable,
+  });
+});
+```
+
+Your existing `/api/update/apply` route stays as-is — it owns the ContainerConfig rebuild, persistence, and post-apply glue.
+
+### Offline handling (boats at sea)
+
+The service treats network unavailability as the **normal expected state**, not as an error condition. When a check fails with a network error (`ENETUNREACH`, `ECONNREFUSED`, DNS failure, fetch timeout, etc.):
+
+- The result returns with `reason: "offline"` and `fromCache: true`, copying values from the last successful check
+- Your config panel sees HTTP 200 with the cached data, **never** a 5xx error
+- No `app.error` is logged
+- No Signal K notification is emitted
+- The offline failure does NOT count toward auto-unregister
+
+When network comes back, the next scheduled check (or a manual one) just succeeds. No exponential backoff, no manual recovery needed.
+
+The persistent cache lives at `${app.getDataDirPath()}/updates-cache.json` and survives Signal K restarts. A boat that powers up mid-ocean still sees the last-known-good check rather than "unknown".
+
+### Auto-unregister on persistent real errors
+
+After 5 consecutive **real** errors (HTTP 4xx/5xx, JSON parse failure, repo renamed, etc. — but **not** offline errors), the service auto-unregisters and logs an error. This bounds damage from a broken registration. The consumer plugin can re-register after fixing the issue (typically by restarting).
+
+### Notifications
+
+When a check transitions from "up-to-date" to "update-available", the service emits a Signal K notification to `notifications.plugins.<pluginId>.updateAvailable`. This is picked up by notification subscribers (PushOver, etc.) without any additional UI integration. Notifications are emitted only on transitions, not on every check.
+
+### Critical rules
+
+1. **`register()` is safe to call before runtime is ready.** It's pure bookkeeping — the scheduler defers the first tick until `getRuntime()` returns non-null. Your plugin still must poll `getRuntime()` before doing other container operations, but the registration call itself is safe.
+2. **`currentTag` MUST be a function**, not a captured value. The user can edit the version in plugin options without restarting your plugin, and `currentTag` is called fresh on every check.
+3. **You must `unregister()` in your plugin's `stop()`**. Otherwise stale registrations linger.
+4. **If signalk-container restarts, your registration is lost.** Your plugin must re-poll and re-register, just like with `ensureRunning`.
+5. **For floating tags, `updateAvailable` means "rebuild detected", not "newer version".** Your UI should make this distinction clear when `tagKind === "floating"`.
+6. **Don't auto-apply.** The service is detection-only — your plugin owns the apply path. The user clicks the button.
+
 ---
 
 ## TypeScript Types
@@ -345,11 +477,22 @@ interface ContainerManagerApi {
     onProgress?: (msg: string) => void,
   ) => Promise<void>;
   imageExists: (image: string) => Promise<boolean>;
+  getImageDigest: (imageOrContainer: string) => Promise<string | null>;
   runJob: (
     config: unknown,
   ) => Promise<{ status: string; exitCode?: number; log: string[] }>;
   prune: () => Promise<{ imagesRemoved: number; spaceReclaimed: string }>;
   listContainers: () => Promise<unknown[]>;
+  updates: {
+    register: (reg: unknown) => void;
+    unregister: (pluginId: string) => void;
+    checkOne: (pluginId: string) => Promise<unknown>;
+    getLastResult: (pluginId: string) => unknown | null;
+    sources: {
+      githubReleases: (repo: string, options?: unknown) => unknown;
+      dockerHubTags: (image: string, options?: unknown) => unknown;
+    };
+  };
 }
 ```
 

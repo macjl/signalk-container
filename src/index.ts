@@ -1,4 +1,5 @@
 import { IRouter } from "express";
+import path from "path";
 import {
   ContainerConfig,
   ContainerInfo,
@@ -19,6 +20,7 @@ import {
   ensureRunning,
   execInContainer,
   getContainerState,
+  getImageDigest,
   imageExists,
   listContainers,
   pruneImages,
@@ -30,12 +32,17 @@ import {
   stopContainer,
 } from "./containers";
 import { runJob } from "./jobs";
+import { UpdateService } from "./updates/service";
+import { FileUpdateCache } from "./updates/cache";
+import { registerUpdateRoutes } from "./updates/routes";
 
 interface App {
   debug: (...args: unknown[]) => void;
   error: (...args: unknown[]) => void;
   setPluginStatus: (msg: string) => void;
   setPluginError: (msg: string) => void;
+  getDataDirPath?: () => string;
+  handleMessage?: (pluginId: string, delta: unknown) => void;
   [key: string]: unknown;
 }
 
@@ -43,6 +50,7 @@ module.exports = (app: App) => {
   let runtimeInfo: ContainerRuntimeInfo | null = null;
   let pruneTimer: NodeJS.Timeout | null = null;
   const healthTimers = new Map<string, NodeJS.Timeout>();
+  let updateService: UpdateService | null = null;
 
   const api: ContainerManagerApi = {
     getRuntime() {
@@ -64,6 +72,11 @@ module.exports = (app: App) => {
         runtimeInfo,
         qualifyImageForRuntime(image, runtimeInfo),
       );
+    },
+
+    async getImageDigest(imageOrContainer: string) {
+      if (!runtimeInfo) return null;
+      return getImageDigest(runtimeInfo, imageOrContainer);
     },
 
     async ensureRunning(
@@ -160,7 +173,47 @@ module.exports = (app: App) => {
       if (!runtimeInfo) throw new Error("No container runtime available");
       await disconnectFromNetwork(runtimeInfo, containerName, networkName);
     },
+
+    // `updates` is wired up in start() once the data dir is known.
+    // Until then, register() is a silent no-op via the stub below.
+    get updates() {
+      return updateService ?? stubUpdateService;
+    },
   };
+
+  /**
+   * Stub update service used between module load and start(). Calls
+   * are silent no-ops so consumer plugins can register unconditionally.
+   * Replaced by a real UpdateService instance in start().
+   */
+  const stubUpdateService = {
+    register: () => {},
+    unregister: () => {},
+    checkOne: async () => {
+      throw new Error("Container manager not yet started");
+    },
+    checkAll: async () => [],
+    getLastResult: () => null,
+    listRegistrations: () => [],
+    sources: {
+      githubReleases: () => ({
+        async fetch() {
+          return {
+            kind: "error" as const,
+            error: "Container manager not yet started",
+          };
+        },
+      }),
+      dockerHubTags: () => ({
+        async fetch() {
+          return {
+            kind: "error" as const,
+            error: "Container manager not yet started",
+          };
+        },
+      }),
+    },
+  } as unknown as UpdateService;
 
   const plugin = {
     id: "signalk-container",
@@ -189,10 +242,73 @@ module.exports = (app: App) => {
           title: "Max concurrent one-shot jobs",
           description: "Limit parallel container job executions",
         },
+        updateCheckInterval: {
+          type: "string",
+          default: "24h",
+          title: "Update check interval",
+          description:
+            "How often to check for container image updates (e.g. 24h, 12h, 1h). Min 1h.",
+        },
+        backgroundUpdateChecks: {
+          type: "boolean",
+          default: true,
+          title: "Background update checks",
+          description:
+            "Periodically check for container image updates in the background. Disable on metered connections — manual checks via the UI button still work.",
+        },
       },
     },
 
     start(config: PluginConfig) {
+      // Instantiate the update service synchronously so consumer
+      // plugins can call containers.updates.register(...) before
+      // the runtime is detected. The service tolerates a null
+      // runtime — it queues registrations and runs them on the
+      // first scheduled tick after detectRuntime() succeeds.
+      const dataDir = app.getDataDirPath
+        ? app.getDataDirPath()
+        : "/tmp/signalk-container";
+      const cachePath = path.join(dataDir, "updates-cache.json");
+      const intervalMs = parseDurationOrDefault(
+        config.updateCheckInterval,
+        24 * 60 * 60 * 1000,
+      );
+      updateService = new UpdateService({
+        app: {
+          debug: (msg, ...args) => app.debug(msg, ...args),
+          error: (msg, ...args) => app.error(msg, ...args),
+          handleMessage: app.handleMessage
+            ? (id, delta) => app.handleMessage!(id, delta)
+            : undefined,
+        },
+        containers: {
+          getRuntime: () => runtimeInfo,
+          getState: (name) =>
+            runtimeInfo
+              ? getContainerState(runtimeInfo, name)
+              : Promise.resolve("no-runtime" as ContainerState),
+          pullImage: async (image) => {
+            if (!runtimeInfo) throw new Error("No container runtime available");
+            await pullImage(
+              runtimeInfo,
+              qualifyImageForRuntime(image, runtimeInfo),
+            );
+          },
+          getImageDigest: async (imageOrContainer) => {
+            if (!runtimeInfo) return null;
+            return getImageDigest(runtimeInfo, imageOrContainer);
+          },
+        },
+        clock: {
+          now: () => Date.now(),
+          setTimer: (fn, delayMs) => setTimeout(fn, delayMs),
+          clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
+        },
+        cache: new FileUpdateCache(cachePath, (msg) => app.debug(msg)),
+        defaultCheckIntervalMs: intervalMs,
+        backgroundChecks: config.backgroundUpdateChecks !== false,
+      });
+
       // Expose API on global so other plugins can find it.
       // Each plugin gets a shallow copy of app (_.assign({}, app)),
       // so setting on app doesn't propagate. Global is the shared bus.
@@ -260,6 +376,10 @@ module.exports = (app: App) => {
         clearInterval(timer);
       }
       healthTimers.clear();
+      if (updateService) {
+        updateService.stop();
+        updateService = null;
+      }
       delete (globalThis as any).__signalk_containerManager;
     },
 
@@ -337,8 +457,39 @@ module.exports = (app: App) => {
           });
         }
       });
+
+      // Update detection routes (registered if and only if the
+      // service was instantiated in start()).
+      if (updateService) {
+        registerUpdateRoutes(router, updateService, () => runtimeInfo !== null);
+      }
     },
   };
 
   return plugin;
 };
+
+function parseDurationOrDefault(
+  input: string | undefined,
+  fallback: number,
+): number {
+  if (!input) return fallback;
+  const m = input.trim().match(/^(\d+)\s*(ms|s|m|h|d)?$/i);
+  if (!m) return fallback;
+  const n = Number(m[1]);
+  const unit = (m[2] ?? "ms").toLowerCase();
+  switch (unit) {
+    case "ms":
+      return n;
+    case "s":
+      return n * 1000;
+    case "m":
+      return n * 60 * 1000;
+    case "h":
+      return n * 60 * 60 * 1000;
+    case "d":
+      return n * 24 * 60 * 60 * 1000;
+    default:
+      return fallback;
+  }
+}

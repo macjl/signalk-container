@@ -76,6 +76,12 @@ export interface ContainerManagerApi {
   getRuntime(): ContainerRuntimeInfo | null;
   pullImage(image: string, onProgress?: (msg: string) => void): Promise<void>;
   imageExists(image: string): Promise<boolean>;
+  /**
+   * Return the local image digest (sha256 ID) for an image reference or
+   * container name, or null if not present. Used by the update detection
+   * service for floating-tag drift checks.
+   */
+  getImageDigest(imageOrContainer: string): Promise<string | null>;
   ensureRunning(
     name: string,
     config: ContainerConfig,
@@ -99,10 +105,19 @@ export interface ContainerManagerApi {
     containerName: string,
     networkName: string,
   ): Promise<void>;
+  /**
+   * Centralized container-image update detection. Consumer plugins
+   * register their containers and the service handles version checking,
+   * scheduling, caching, and offline-tolerance.
+   * See doc/plugin-developer-guide.md "Update detection" for usage.
+   */
+  updates: import("./updates/types").UpdateServiceApi;
 }
 
 export interface PluginConfig {
   runtime: RuntimePreference;
   pruneSchedule: "off" | "weekly" | "monthly";
   maxConcurrentJobs: number;
+  updateCheckInterval?: string;
+  backgroundUpdateChecks?: boolean;
 }
