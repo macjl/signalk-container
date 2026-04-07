@@ -306,19 +306,32 @@ module.exports = (app: App) => {
         app.debug(`updateResources(${name}): ${w}`);
       }
 
-      const previous = effectiveResources.get(name) ?? {};
+      // Read the LIVE state from podman, not the in-memory cache.
+      // The cache (`effectiveResources`) is good for "what did we last
+      // try to apply" tracking, but it can drift from reality:
+      //   - on Signal K restart it's empty
+      //   - if the previous v0.1.6 buggy code claimed a successful
+      //     unset that podman didn't actually do, the cache reflects
+      //     the user's intent but the container has the old value
+      //   - manual `podman update` from outside Signal K isn't tracked
+      // Always compare against truth.
+      const liveBefore = await getLiveResources(runtimeInfo, name);
 
-      // No-op when nothing actually changes — but verify the container
-      // exists first, otherwise we'd silently claim success against a
-      // container that was removed out from under us. (Part of Bug C
-      // fix; tryLiveUpdate also enforces this for the empty-flags case.)
-      if (resourceLimitsEqual(previous, filteredLimits)) {
+      // No-op when the live container already matches what's being
+      // requested. Verify existence by way of getLiveResources returning
+      // an empty object — if liveBefore is {}, either the container is
+      // missing OR it has no resource limits at all, both of which
+      // require a separate state check.
+      if (resourceLimitsEqual(liveBefore, filteredLimits)) {
         const state = await getContainerState(runtimeInfo, name);
         if (state === "missing") {
           throw new Error(
             `updateResources: container ${fullName} does not exist`,
           );
         }
+        // Live state already matches the request — true no-op.
+        // Update the cache so it stops lying if it was stale.
+        effectiveResources.set(name, { ...filteredLimits });
         return {
           method: "live",
           warnings: warnings.length ? warnings : undefined,
@@ -329,10 +342,7 @@ module.exports = (app: App) => {
       // set on the container, AND that field cannot be unset via live
       // update". Memory limits and oom-score-adj are the offenders —
       // podman/docker can lower or raise them, but not return them to
-      // the unlimited/default state without a recreate. Without this
-      // check, the live update would silently no-op the unset and the
-      // cache would lie.
-      const liveBefore = await getLiveResources(runtimeInfo, name);
+      // the unlimited/default state without a recreate.
       const mustRecreateForUnset = fieldsRequiringRecreateForUnset(
         liveBefore,
         filteredLimits,
