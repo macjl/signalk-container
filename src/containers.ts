@@ -23,7 +23,13 @@ export function qualifyImage(
   // registries are not configured. Prefix docker.io/ if missing.
   if (runtime.runtime === "podman") {
     const parts = image.split("/");
-    if (parts.length <= 2 && !parts[0].includes(".")) {
+    // Treat first component as a registry only if it has a dot, a colon
+    // (port), or is exactly "localhost". Otherwise, prefix docker.io/.
+    const looksLikeRegistry =
+      parts[0].includes(".") ||
+      parts[0].includes(":") ||
+      parts[0] === "localhost";
+    if (parts.length <= 2 && !looksLikeRegistry) {
       return `docker.io/${image}`;
     }
   }
@@ -192,13 +198,16 @@ async function fixVolumePermissions(
   const mounts = inspect.stdout.trim().split(/\s+/).filter(Boolean);
   if (mounts.length === 0) return;
 
-  // Fix permissions so the host user can delete the files
+  // Grant "others" read/write/execute on bind mounts so the host user
+  // (which is "others" relative to the container's user namespace mapped
+  // UID) can delete the files. Owner permissions stay unchanged. Falls
+  // back silently if chmod isn't available in the image (distroless etc.).
   await execRuntime(runtime, [
     "exec",
     fullName,
     "chmod",
     "-R",
-    "a+rwX",
+    "o+rwX",
     ...mounts,
   ]);
 }
@@ -324,7 +333,13 @@ export async function connectToNetwork(
     networkName,
     fullName,
   ]);
-  if (result.exitCode !== 0 && !result.stderr.includes("already connected")) {
+  if (
+    result.exitCode !== 0 &&
+    // Podman: "is already connected to network"
+    !result.stderr.includes("already connected") &&
+    // Docker: "endpoint with name ... already exists in network"
+    !result.stderr.includes("already exists in network")
+  ) {
     throw new Error(
       `Failed to connect ${fullName} to ${networkName}: ${result.stderr}`,
     );

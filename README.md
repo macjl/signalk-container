@@ -107,6 +107,71 @@ All mounted at `/plugins/signalk-container/api/`:
 - Podman or Docker installed on the host
 - Signal K server
 
+## Running Signal K in a Container
+
+If your Signal K server itself runs inside a container (Docker, Podman),
+this plugin needs access to the host's container runtime to manage other
+containers. The plugin auto-detects this scenario via `/.dockerenv` or
+`/run/.containerenv` and prefixes the status with `(in-container)`.
+
+For the plugin to work, you must expose the host's container runtime to
+the Signal K container:
+
+### Docker (with security caveats)
+
+```yaml
+services:
+  signalk:
+    image: signalk/signalk-server
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
+```
+
+The Signal K image must include the `docker` CLI binary, OR you mount
+it from the host as shown above. Containers managed by the plugin
+become **siblings** of the Signal K container, not nested.
+
+> [!warning]
+> Mounting `/var/run/docker.sock` gives the container **root-equivalent
+> access to the host**. Anyone who compromises Signal K (including via
+> a malicious plugin) can take over the entire host. Only use this if
+> you understand and accept the security implications.
+
+### Podman (rootless, safer)
+
+```yaml
+services:
+  signalk:
+    image: signalk/signalk-server
+    volumes:
+      - $XDG_RUNTIME_DIR/podman/podman.sock:/var/run/podman.sock
+      - /usr/bin/podman:/usr/bin/podman:ro
+    environment:
+      - DOCKER_HOST=unix:///var/run/podman.sock
+```
+
+Rootless Podman runs as your user, not root, so the security exposure
+is limited to your user account rather than the entire host.
+
+### Networking caveats
+
+When Signal K runs in a container, containers spawned by this plugin
+are **siblings** on the host's container network, not inside Signal K's
+network namespace. This affects:
+
+- The shared `sk-network` works only if Signal K is also attached to it
+  (add it externally or via the same compose file)
+- `host.containers.internal` from spawned containers points to the host
+  itself, not the Signal K container — use Signal K's container name
+  for direct communication
+
+### Recommended setup
+
+For the simplest experience with managed containers, run **Signal K
+natively on the host** rather than in a container. The plugin and its
+ecosystem (signalk-questdb, signalk-grafana) are designed for this case.
+
 ## License
 
 MIT

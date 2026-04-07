@@ -1,5 +1,21 @@
 import { execFile } from "child_process";
+import { existsSync } from "fs";
 import { ContainerRuntimeInfo, RuntimeName, RuntimePreference } from "./types";
+
+/**
+ * Detect if the Signal K server is itself running inside a container.
+ * Indicators:
+ * - /.dockerenv file (Docker)
+ * - /run/.containerenv file (Podman)
+ * - container env var (some setups)
+ */
+export function isContainerized(): boolean {
+  return (
+    existsSync("/.dockerenv") ||
+    existsSync("/run/.containerenv") ||
+    process.env.container !== undefined
+  );
+}
 
 function cleanEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };

@@ -424,6 +424,34 @@ Webpack outputs to `public/` which Signal K serves at `/{package-name}/`. The Ad
 
 ---
 
+## Containerized Signal K
+
+When Signal K runs inside a container itself, signalk-container needs the host's Docker/Podman socket and CLI binary mounted in. Detect this case via `isContainerized()`:
+
+```typescript
+import { isContainerized } from "signalk-container/dist/runtime";
+
+if (isContainerized()) {
+  // Signal K is running inside a container
+  // - host runtime must be exposed (docker.sock + binary)
+  // - spawned containers are siblings, not nested
+  // - host.containers.internal points to the actual host
+  // - shared networks need explicit setup
+}
+```
+
+The signalk-container plugin uses this check to:
+
+- Show `(in-container)` prefix in status
+- Provide a more helpful error when no runtime is found
+- Document the security and networking implications in the README
+
+For consumer plugins (like signalk-questdb): if you rely on `host.containers.internal` to reach Signal K from a spawned container, that won't work when Signal K itself is in a container — it would point to the host, not the SK container. Use the SK container's name on the shared network instead.
+
+See the README's "Running Signal K in a Container" section for full details on socket mounting, security caveats, and networking.
+
+---
+
 ## Common Mistakes Summary
 
 | Mistake                                    | Symptom                                      | Fix                                            |

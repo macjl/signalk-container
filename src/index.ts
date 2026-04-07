@@ -11,7 +11,7 @@ import {
   PluginConfig,
   PruneResult,
 } from "./types";
-import { detectRuntime } from "./runtime";
+import { detectRuntime, isContainerized } from "./runtime";
 import {
   connectToNetwork,
   disconnectFromNetwork,
@@ -201,19 +201,29 @@ module.exports = (app: App) => {
       // Async init — server does not await start()
       (async () => {
         const preference = config.runtime ?? "auto";
+        const containerized = isContainerized();
+        if (containerized) {
+          app.debug(
+            "Signal K is running inside a container. Container runtime " +
+              "must be exposed (docker.sock + binary) for this plugin to work.",
+          );
+        }
         app.debug("detecting runtime, preference=%s", preference);
         runtimeInfo = await detectRuntime(preference);
         app.debug("detectRuntime result: %o", runtimeInfo);
 
         if (!runtimeInfo) {
-          app.setPluginError(
-            "No container runtime found. Install Podman: sudo apt install podman",
-          );
+          const msg = containerized
+            ? "No container runtime found. Signal K appears to run inside a container — " +
+              "you must mount the host's docker socket and binary. See README."
+            : "No container runtime found. Install Podman: sudo apt install podman";
+          app.setPluginError(msg);
           return;
         }
 
+        const statusPrefix = containerized ? "(in-container) " : "";
         app.setPluginStatus(
-          `${runtimeInfo.runtime} ${runtimeInfo.version}${runtimeInfo.isPodmanDockerShim ? " (podman shim)" : ""}`,
+          `${statusPrefix}${runtimeInfo.runtime} ${runtimeInfo.version}${runtimeInfo.isPodmanDockerShim ? " (podman shim)" : ""}`,
         );
 
         if (config.pruneSchedule && config.pruneSchedule !== "off") {
