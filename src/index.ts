@@ -87,10 +87,58 @@ module.exports = (app: App) => {
   const lastConfigs = new Map<string, ContainerConfig>();
   let currentOverrides: Record<string, ContainerResourceLimits> = {};
   const effectiveResources = new Map<string, ContainerResourceLimits>();
+  // Pristine plugin-default resource limits, captured at the top of the
+  // `api.ensureRunning` wrapper BEFORE the override merge. Lets the
+  // "Reset to plugin defaults" feature restore what the consumer plugin
+  // originally asked for. Without this, we'd have no way to reconstruct
+  // the default — lastConfigs stores the post-merge result.
+  const pluginDefaults = new Map<string, ContainerResourceLimits>();
   // Captured at start(config). Used by recordOverride to build the full
   // cfg object when calling app.savePluginOptions, so the disk file keeps
   // runtime/pruneSchedule/etc. untouched alongside the new override.
   let currentConfig: PluginConfig | null = null;
+
+  /**
+   * Persist the current in-memory `currentOverrides` map to disk via
+   * Signal K's `app.savePluginOptions`. Best-effort: failures are
+   * logged but non-fatal (the live container state is already correct;
+   * we just lose durability across Signal K restarts).
+   *
+   * Does NOT cause a plugin restart — `savePluginOptions` writes to
+   * plugin-config-data/signalk-container.json without triggering the
+   * Signal K admin UI's stop-and-restart flow, so this is safe to
+   * call from inside a request handler without causing downtime.
+   *
+   * The `debugContext` is included in the debug log line so it's
+   * possible to tell which code path triggered the write.
+   */
+  function persistOverridesToDisk(debugContext: string): void {
+    if (!currentConfig || !app.savePluginOptions) {
+      app.debug(
+        `persistOverridesToDisk(${debugContext}): skipped (currentConfig=${currentConfig !== null}, savePluginOptions=${!!app.savePluginOptions})`,
+      );
+      return;
+    }
+    const newCfg = {
+      ...currentConfig,
+      containerOverrides: { ...currentOverrides },
+    };
+    // Keep currentConfig in sync so subsequent writes see the latest
+    // containerOverrides too.
+    currentConfig = newCfg;
+    app.savePluginOptions(newCfg, (err) => {
+      if (err) {
+        app.error(
+          `Failed to persist containerOverrides to disk (${debugContext}): ${err.message}. ` +
+            `The in-memory state is correct but will be lost on the next Signal K restart.`,
+        );
+      } else {
+        app.debug(
+          `persistOverridesToDisk(${debugContext}): wrote to plugin-config-data`,
+        );
+      }
+    });
+  }
 
   /**
    * Record a user-requested override into `currentOverrides` so that
@@ -99,10 +147,8 @@ module.exports = (app: App) => {
    * correctly merges the override on top of the plugin's default.
    *
    * Also persists the updated override map to disk via
-   * `app.savePluginOptions` so the user's Apply click survives both
-   * page reloads AND full Signal K restarts. Persistence failure is
-   * logged but non-fatal — the cgroup change is already applied, we
-   * just lose durability.
+   * `persistOverridesToDisk` so the user's Apply click survives both
+   * page reloads AND full Signal K restarts.
    *
    * Called from inside `updateResources` after a successful apply.
    * Stores the ORIGINAL unfiltered `limits` (pre-cgroup-filter), so
@@ -122,38 +168,20 @@ module.exports = (app: App) => {
     } else {
       currentOverrides[name] = { ...limits };
     }
+    persistOverridesToDisk(`recordOverride(${name})`);
+  }
 
-    // Persist to disk via savePluginOptions. This is best-effort:
-    // a failure leaves the in-memory state correct and the cgroup
-    // already applied. Signal K's savePluginOptions writes to
-    // ${dataDir}/plugin-config-data/signalk-container.json and does
-    // NOT cause a plugin restart, so this is safe to call from
-    // inside a request handler without causing downtime.
-    if (!currentConfig || !app.savePluginOptions) {
-      app.debug(
-        `recordOverride(${name}): no persistence (currentConfig=${currentConfig !== null}, savePluginOptions=${!!app.savePluginOptions})`,
-      );
-      return;
-    }
-    const newCfg = {
-      ...currentConfig,
-      containerOverrides: { ...currentOverrides },
-    };
-    // Keep currentConfig in sync so a subsequent recordOverride call
-    // sees the latest containerOverrides too. Otherwise two Apply
-    // clicks in the same plugin lifetime would lose the earlier one.
-    currentConfig = newCfg;
-    app.savePluginOptions(newCfg, (err) => {
-      if (err) {
-        app.error(
-          `Failed to persist containerOverrides to disk: ${err.message}. ` +
-            `The override is applied live to the container but will be ` +
-            `lost on the next Signal K restart.`,
-        );
-      } else {
-        app.debug(`recordOverride(${name}): persisted to plugin-config-data`);
-      }
-    });
+  /**
+   * Remove a container's override entirely and persist to disk.
+   * Used by the reset-to-plugin-defaults path (DELETE endpoint) where
+   * we want to clear the override independently of calling
+   * updateResources (which would re-add it via recordOverride at the
+   * end of the successful-apply branches).
+   */
+  function clearOverride(name: string): void {
+    if (!(name in currentOverrides)) return;
+    delete currentOverrides[name];
+    persistOverridesToDisk(`clearOverride(${name})`);
   }
 
   const api: ContainerManagerApi = {
@@ -189,6 +217,15 @@ module.exports = (app: App) => {
       options?: HealthCheckOptions,
     ) {
       if (!runtimeInfo) throw new Error("No container runtime available");
+
+      // Capture the plugin's pristine default resource limits BEFORE
+      // merging with the user override. This is the only place in the
+      // system that sees the "default" as a separate input; lastConfigs
+      // stores the post-merge result. We need the default for:
+      //   - "Reset to plugin defaults" action in the UI
+      //   - (future) detecting when an override happens to match the
+      //     default and offering to clear it
+      pluginDefaults.set(name, { ...(config.resources ?? {}) });
 
       // Merge user override on top of the plugin's default resources.
       // The user override (from signalk-container's own plugin config)
@@ -831,6 +868,7 @@ module.exports = (app: App) => {
       }
       lastConfigs.clear();
       effectiveResources.clear();
+      pluginDefaults.clear();
       currentOverrides = {};
       currentConfig = null;
       delete (globalThis as any).__signalk_containerManager;
@@ -897,6 +935,58 @@ module.exports = (app: App) => {
             // "Override active" badge from a single source (POST
             // response on click, GET response on reload).
             override: currentOverrides[name] ?? null,
+          });
+        } catch (err) {
+          res.status(500).json({
+            error: err instanceof Error ? err.message : "Unknown error",
+          });
+        }
+      });
+
+      /**
+       * Clear any user override for a container and restore the
+       * consumer plugin's pristine default resource limits. The
+       * plugin default is captured at the top of api.ensureRunning
+       * (pluginDefaults map) before the merge layer mixes in any
+       * override — this endpoint restores the pure default state,
+       * which is IMPOSSIBLE to express via the normal POST route
+       * (POST with `{}` would leave the container with no limits,
+       * not the default limits).
+       *
+       * Requires that the consumer plugin has called ensureRunning
+       * at least once, otherwise there's nothing to reset to.
+       */
+      router.delete("/api/containers/:name/resources", async (req, res) => {
+        if (!runtimeInfo) {
+          res.status(503).json({ error: "No container runtime available" });
+          return;
+        }
+        const name = String(req.params.name);
+        const pluginDefault = pluginDefaults.get(name);
+        if (!pluginDefault) {
+          res.status(404).json({
+            error:
+              `No plugin default recorded for ${name}. The consumer plugin ` +
+              `must call ensureRunning() first (which happens automatically ` +
+              `on plugin startup).`,
+          });
+          return;
+        }
+        try {
+          // Apply the plugin's pristine default to the running container.
+          // This goes through updateResources which handles the usual
+          // live-vs-recreate decision AND calls recordOverride at the
+          // end — which is the opposite of what we want for "clear the
+          // override". So we clear AFTERWARDS (two writes to disk, but
+          // correct final state).
+          const result = await api.updateResources(name, pluginDefault);
+          clearOverride(name);
+          res.json({
+            name,
+            cleared: true,
+            ...result,
+            effective: api.getResources(name),
+            override: null,
           });
         } catch (err) {
           res.status(500).json({

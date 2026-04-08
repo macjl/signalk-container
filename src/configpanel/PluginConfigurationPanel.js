@@ -125,6 +125,15 @@ const S = {
     color: "#666",
     flexWrap: "wrap",
   },
+  updatesRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    padding: "0 14px 10px 34px",
+    fontSize: 11,
+    color: "#666",
+    flexWrap: "wrap",
+  },
   limitBadge: {
     display: "inline-flex",
     alignItems: "center",
@@ -431,6 +440,122 @@ const RESOURCE_FIELDS = [
 ];
 
 /**
+ * Format an ISO timestamp as "5m ago" / "2h ago" / "3d ago" for the
+ * update-check staleness indicator. Defensive against server clock
+ * skew (clamps negative deltas to 0).
+ */
+function formatTimeAgo(isoTimestamp) {
+  try {
+    const then = new Date(isoTimestamp).getTime();
+    const seconds = Math.max(0, Math.floor((Date.now() - then) / 1000));
+    if (seconds < 5) return "just now";
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+  } catch {
+    return isoTimestamp;
+  }
+}
+
+/**
+ * Format an UpdateCheckResult into a short human-readable status line
+ * shown in the panel-wide actionStatus area after a manual check.
+ */
+function formatUpdateStatus(result) {
+  if (!result) return "No update data";
+  const {
+    runningTag,
+    currentVersion,
+    latestVersion,
+    updateAvailable,
+    reason,
+    fromCache,
+  } = result;
+  if (reason === "offline") {
+    return fromCache
+      ? `\u{1F4E1} Offline — last cached result shows ${updateAvailable ? "update available" : "up to date"}`
+      : "\u{1F4E1} Offline — no cached result yet";
+  }
+  if (reason === "newer-version") {
+    return `\u2191 Update available: ${currentVersion} \u2192 ${latestVersion}`;
+  }
+  if (reason === "digest-drift") {
+    const ls = latestVersion ? ` (latest stable: ${latestVersion})` : "";
+    return `\u21BB Rebuild available for :${runningTag}${ls}`;
+  }
+  if (reason === "up-to-date") {
+    return `\u2705 Up to date${currentVersion ? " (" + currentVersion + ")" : ""}`;
+  }
+  if (reason === "older-than-pinned") {
+    return `\u2139 Pinned to ${currentVersion}, latest stable is ${latestVersion}`;
+  }
+  if (reason === "error") {
+    return `\u26A0 Check error: ${result.error || "unknown"}`;
+  }
+  return `State: ${reason || "unknown"}`;
+}
+
+/**
+ * Compact label + style for the per-container update badge rendered
+ * inline in the container card. Returns null to hide the badge entirely
+ * for states we consider uninteresting (e.g. unknown while the check
+ * hasn't fired yet). Colors mirror formatLimitBadge semantics.
+ */
+function formatUpdateBadge(result) {
+  if (!result || !result.reason) return null;
+  const { reason, runningTag, currentVersion, latestVersion, fromCache } =
+    result;
+  if (reason === "newer-version") {
+    return {
+      label: `\u2191 ${latestVersion || "update"} available`,
+      bg: "#fef3c7",
+      fg: "#92400e",
+      title: `Update available: ${currentVersion} \u2192 ${latestVersion}`,
+    };
+  }
+  if (reason === "digest-drift") {
+    return {
+      label: `\u21BB rebuild available`,
+      bg: "#fef3c7",
+      fg: "#92400e",
+      title: `Image rebuild available for :${runningTag}${latestVersion ? ` (latest stable ${latestVersion})` : ""}`,
+    };
+  }
+  if (reason === "offline") {
+    return {
+      label: fromCache ? `\u{1F4E1} offline (cached)` : `\u{1F4E1} offline`,
+      bg: "#e5e7eb",
+      fg: "#4b5563",
+      title: fromCache
+        ? "Network unreachable; showing last cached check result"
+        : "Network unreachable; no cached result yet",
+    };
+  }
+  if (reason === "error") {
+    return {
+      label: `\u26A0 check error`,
+      bg: "#fee2e2",
+      fg: "#991b1b",
+      title: result.error || "Update check error",
+    };
+  }
+  if (reason === "up-to-date") {
+    return {
+      label: `\u2705 up to date`,
+      bg: "#dcfce7",
+      fg: "#166534",
+      title: `Up to date${currentVersion ? " (" + currentVersion + ")" : ""}`,
+    };
+  }
+  // unknown or older-than-pinned: no badge
+  return null;
+}
+
+/**
  * Normalize a value read from the form state into the right shape for
  * the POST body:
  *   - null → null (explicit unset)
@@ -491,6 +616,7 @@ function ResourceLimitsEditor({
   effective, // ContainerResourceLimits (merged plugin default + override)
   initialOverride, // ContainerResourceLimits or undefined
   onApply, // (formState) => Promise<{ method, warnings?, error? }>
+  onResetToDefault, // () => Promise<{ method, warnings?, error? }>
   onClose,
 }) {
   // Seed form state from the effective limits (what's actually applied)
@@ -524,6 +650,7 @@ function ResourceLimitsEditor({
     );
   });
   const [applying, setApplying] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [result, setResult] = useState(null);
 
   const updateField = (key, value) => {
@@ -537,7 +664,9 @@ function ResourceLimitsEditor({
     }));
   };
 
-  const doReset = () => {
+  // "Revert" discards any unsaved form edits and re-seeds from the
+  // current effective state. Does NOT touch the server.
+  const doRevert = () => {
     setFormState(seed());
     setResult(null);
   };
@@ -557,6 +686,31 @@ function ResourceLimitsEditor({
       setResult({ error: err.message || String(err) });
     }
     setApplying(false);
+  };
+
+  // "Reset to default" clears the stored override entirely AND
+  // re-applies the consumer plugin's pristine default to the
+  // running container. Destructive (may cause a recreate with ~5s
+  // downtime if memory limits need to be unset) — confirm first.
+  const doResetToDefault = async () => {
+    if (
+      !window.confirm(
+        `Reset ${containerName} to the plugin's default resource limits? ` +
+          `This will remove your override and may cause a brief container ` +
+          `recreate (~5s of downtime) if memory limits need to be unset.`,
+      )
+    ) {
+      return;
+    }
+    setResetting(true);
+    setResult(null);
+    try {
+      const res = await onResetToDefault();
+      setResult(res);
+    } catch (err) {
+      setResult({ error: err.message || String(err) });
+    }
+    setResetting(false);
   };
 
   const renderField = (f) => {
@@ -627,6 +781,7 @@ function ResourceLimitsEditor({
         <button
           type="button"
           onClick={onClose}
+          disabled={applying || resetting}
           style={{
             ...S.btn,
             padding: "6px 12px",
@@ -634,13 +789,39 @@ function ResourceLimitsEditor({
             background: "#fff",
             color: "#6b7280",
             border: "1px solid #d1d5db",
+            ...(applying || resetting ? S.btnDisabled : {}),
           }}
         >
           Close
         </button>
+        {/* "Reset to plugin default" — clears the stored override AND
+            forces a recreate to the consumer plugin's pristine default
+            limits. Only shown if we know a plugin default exists
+            (initialOverride is truthy OR effective has fields — either
+            way there's something to reset). Styled as a subtle warning
+            to signal it's destructive. */}
         <button
           type="button"
-          onClick={doReset}
+          onClick={doResetToDefault}
+          disabled={applying || resetting}
+          title="Clear override and restore plugin-default limits"
+          style={{
+            ...S.btn,
+            padding: "6px 12px",
+            fontSize: 12,
+            background: "#fff",
+            color: "#d97706",
+            border: "1px solid #f59e0b",
+            ...(applying || resetting ? S.btnDisabled : {}),
+          }}
+        >
+          {resetting ? "Resetting..." : "Reset to default"}
+        </button>
+        <button
+          type="button"
+          onClick={doRevert}
+          disabled={applying || resetting}
+          title="Discard unsaved changes in this form (does not touch the server)"
           style={{
             ...S.btn,
             padding: "6px 12px",
@@ -648,20 +829,21 @@ function ResourceLimitsEditor({
             background: "#fff",
             color: "#6b7280",
             border: "1px solid #d1d5db",
+            ...(applying || resetting ? S.btnDisabled : {}),
           }}
         >
-          Reset
+          Revert
         </button>
         <button
           type="button"
           onClick={doApply}
-          disabled={applying}
+          disabled={applying || resetting}
           style={{
             ...S.btn,
             ...S.btnPrimary,
             padding: "6px 14px",
             fontSize: 12,
-            ...(applying ? S.btnDisabled : {}),
+            ...(applying || resetting ? S.btnDisabled : {}),
           }}
         >
           {applying ? "Applying..." : "Apply"}
@@ -742,6 +924,17 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   // the server"; a non-null object (even an empty one) means "override
   // exists".
   const [overrideStates, setOverrideStates] = useState({});
+  // Update-check results from signalk-container's update service, keyed
+  // by UNPREFIXED container name (not pluginId — so we can look them up
+  // from the container list). Each value is an UpdateCheckResult from
+  // /api/updates or null if no check has been performed yet.
+  // Populated by fetchStatus() via GET /api/updates.
+  const [updateStates, setUpdateStates] = useState({});
+  // Name → pluginId map derived from /api/updates — used for the
+  // "Check now" button which has to hit /api/updates/:pluginId/check.
+  const [pluginIdByContainer, setPluginIdByContainer] = useState({});
+  // Which containers are currently running a manual check (spinner).
+  const [checking, setChecking] = useState(new Set());
   // Which container rows have their resource editor expanded.
   const [expandedLimits, setExpandedLimits] = useState(new Set());
   const [loading, setLoading] = useState(true);
@@ -796,6 +989,32 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         );
         setEffectiveLimits(limitsMap);
         setOverrideStates(overrideMap);
+      }
+
+      // Fetch update-check state from the centralized update service.
+      // Only containers whose consumer plugin has called
+      // containers.updates.register(...) will appear here — mayara
+      // does, questdb/grafana don't (yet). Best-effort; the update
+      // service is a feature of v0.1.4+ so older installs may 404.
+      try {
+        const upRes = await fetch("/plugins/signalk-container/api/updates");
+        if (upRes.ok) {
+          const upList = await upRes.json();
+          if (Array.isArray(upList)) {
+            const updatesMap = {};
+            const pluginIdMap = {};
+            for (const u of upList) {
+              if (u && u.containerName) {
+                updatesMap[u.containerName] = u;
+                if (u.pluginId) pluginIdMap[u.containerName] = u.pluginId;
+              }
+            }
+            setUpdateStates(updatesMap);
+            setPluginIdByContainer(pluginIdMap);
+          }
+        }
+      } catch {
+        // Best effort only.
       }
     } catch {
       setRuntimeInfo(null);
@@ -865,6 +1084,85 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       } else {
         delete next[unprefixedName];
       }
+      return next;
+    });
+    return {
+      method: data.method,
+      warnings: data.warnings,
+    };
+  };
+
+  const checkForUpdate = async (unprefixedName) => {
+    const pluginId = pluginIdByContainer[unprefixedName];
+    if (!pluginId) {
+      setActionStatus(
+        `${unprefixedName}: no update service registered. ` +
+          `The consumer plugin hasn't migrated to signalk-container's update ` +
+          `detection yet.`,
+      );
+      setStatusError(true);
+      return;
+    }
+    setChecking((prev) => {
+      const next = new Set(prev);
+      next.add(unprefixedName);
+      return next;
+    });
+    setActionStatus(`Checking ${unprefixedName} for updates...`);
+    setStatusError(false);
+    try {
+      const res = await fetch(
+        `/plugins/signalk-container/api/updates/${encodeURIComponent(pluginId)}/check`,
+        { method: "POST" },
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setUpdateStates((prev) => ({ ...prev, [unprefixedName]: data }));
+        setActionStatus(formatUpdateStatus(data));
+        setStatusError(false);
+      } else {
+        const data = await res.json().catch(() => ({ error: res.statusText }));
+        setActionStatus(`Check failed: ${data.error}`);
+        setStatusError(true);
+      }
+    } catch (e) {
+      setActionStatus(`Check error: ${e.message}`);
+      setStatusError(true);
+    }
+    setChecking((prev) => {
+      const next = new Set(prev);
+      next.delete(unprefixedName);
+      return next;
+    });
+  };
+
+  const resetLimitsToDefault = async (unprefixedName) => {
+    const res = await fetch(
+      `/plugins/signalk-container/api/containers/${encodeURIComponent(unprefixedName)}/resources`,
+      { method: "DELETE" },
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return {
+        error: data.error || `${res.status} ${res.statusText}`,
+      };
+    }
+    // Update the effective limits cache from the response so the
+    // badges refresh to show the plugin defaults immediately.
+    if (data.effective) {
+      setEffectiveLimits((prev) => ({
+        ...prev,
+        [unprefixedName]: data.effective,
+      }));
+    }
+    // Clear the override state — server has wiped it.
+    setOverrideStates((prev) => ({
+      ...prev,
+      [unprefixedName]: null,
+    }));
+    setContainerOverrides((prev) => {
+      const next = { ...prev };
+      delete next[unprefixedName];
       return next;
     });
     return {
@@ -1124,6 +1422,13 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           const badges = RESOURCE_FIELDS.map((f) =>
             formatLimitBadge(f.key, eff[f.key]),
           ).filter(Boolean);
+          // Update-check state from signalk-container's update service.
+          // Only containers whose plugin has migrated to v0.1.6+ appear
+          // here — for others, updateBadge is null and we hide the row.
+          const updateResult = updateStates[un];
+          const updateBadge = formatUpdateBadge(updateResult);
+          const isUpdateRegistered = !!pluginIdByContainer[un];
+          const isChecking = checking.has(un);
 
           return (
             <div key={ct.name} style={S.containerCard}>
@@ -1207,12 +1512,60 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                 )}
               </div>
 
+              {/* Update-check row: only render when the consumer plugin
+                  has registered with the update service. For containers
+                  that haven't (questdb, grafana pre-migration), we hide
+                  this row entirely to avoid visual clutter. */}
+              {isUpdateRegistered && ct.state === "running" && (
+                <div style={S.updatesRow}>
+                  {updateBadge ? (
+                    <span
+                      style={{
+                        ...S.limitBadge,
+                        background: updateBadge.bg,
+                        color: updateBadge.fg,
+                      }}
+                      title={updateBadge.title}
+                    >
+                      {updateBadge.label}
+                    </span>
+                  ) : (
+                    <span style={{ color: "#9ca3af", fontStyle: "italic" }}>
+                      No update check yet
+                    </span>
+                  )}
+                  {updateResult?.lastSuccessfulCheckAt && (
+                    <span
+                      style={{ fontSize: 10, color: "#9ca3af" }}
+                      title={`Last successful check: ${updateResult.lastSuccessfulCheckAt}`}
+                    >
+                      checked{" "}
+                      {formatTimeAgo(updateResult.lastSuccessfulCheckAt)}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => checkForUpdate(un)}
+                    disabled={isChecking}
+                    title="Force a fresh update check now"
+                    style={{
+                      ...S.editLimitsBtn,
+                      marginLeft: "auto",
+                      ...(isChecking ? S.btnDisabled : {}),
+                    }}
+                  >
+                    {isChecking ? "Checking..." : "Check now ↻"}
+                  </button>
+                </div>
+              )}
+
               {isExpanded && (
                 <ResourceLimitsEditor
                   containerName={un}
                   effective={eff}
                   initialOverride={serverOverride}
                   onApply={(payload) => applyLimits(un, payload)}
+                  onResetToDefault={() => resetLimitsToDefault(un)}
                   onClose={() => toggleLimitsExpand(ct.name)}
                 />
               )}
