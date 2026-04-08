@@ -53,6 +53,16 @@ interface App {
   setPluginError: (msg: string) => void;
   getDataDirPath?: () => string;
   handleMessage?: (pluginId: string, delta: unknown) => void;
+  /**
+   * Persist the plugin's configuration to plugin-config-data/signalk-container.json.
+   * Signal K server-api declares this; we optionally use it from updateResources()
+   * to auto-save a new containerOverride so refreshes don't lose the user's edit.
+   * Callback signature matches @signalk/server-api.
+   */
+  savePluginOptions?: (
+    configuration: object,
+    cb: (err: NodeJS.ErrnoException | null) => void,
+  ) => void;
   [key: string]: unknown;
 }
 
@@ -77,6 +87,74 @@ module.exports = (app: App) => {
   const lastConfigs = new Map<string, ContainerConfig>();
   let currentOverrides: Record<string, ContainerResourceLimits> = {};
   const effectiveResources = new Map<string, ContainerResourceLimits>();
+  // Captured at start(config). Used by recordOverride to build the full
+  // cfg object when calling app.savePluginOptions, so the disk file keeps
+  // runtime/pruneSchedule/etc. untouched alongside the new override.
+  let currentConfig: PluginConfig | null = null;
+
+  /**
+   * Record a user-requested override into `currentOverrides` so that
+   * `GET /api/containers/:name/resources` returns a truthful `override`
+   * field, AND so the next `ensureRunning` call from a consumer plugin
+   * correctly merges the override on top of the plugin's default.
+   *
+   * Also persists the updated override map to disk via
+   * `app.savePluginOptions` so the user's Apply click survives both
+   * page reloads AND full Signal K restarts. Persistence failure is
+   * logged but non-fatal — the cgroup change is already applied, we
+   * just lose durability.
+   *
+   * Called from inside `updateResources` after a successful apply.
+   * Stores the ORIGINAL unfiltered `limits` (pre-cgroup-filter), so
+   * that if the host's cgroup controller set changes (e.g. user adds
+   * cpuset delegation later), the filter layer re-evaluates and
+   * restores the field. Storing the filtered form would permanently
+   * drop any field that was unavailable at the time of the original
+   * apply.
+   *
+   * An empty object `{}` clears the override entirely — that's the
+   * "revert to plugin defaults" case.
+   */
+  function recordOverride(name: string, limits: ContainerResourceLimits): void {
+    const keys = Object.keys(limits);
+    if (keys.length === 0) {
+      delete currentOverrides[name];
+    } else {
+      currentOverrides[name] = { ...limits };
+    }
+
+    // Persist to disk via savePluginOptions. This is best-effort:
+    // a failure leaves the in-memory state correct and the cgroup
+    // already applied. Signal K's savePluginOptions writes to
+    // ${dataDir}/plugin-config-data/signalk-container.json and does
+    // NOT cause a plugin restart, so this is safe to call from
+    // inside a request handler without causing downtime.
+    if (!currentConfig || !app.savePluginOptions) {
+      app.debug(
+        `recordOverride(${name}): no persistence (currentConfig=${currentConfig !== null}, savePluginOptions=${!!app.savePluginOptions})`,
+      );
+      return;
+    }
+    const newCfg = {
+      ...currentConfig,
+      containerOverrides: { ...currentOverrides },
+    };
+    // Keep currentConfig in sync so a subsequent recordOverride call
+    // sees the latest containerOverrides too. Otherwise two Apply
+    // clicks in the same plugin lifetime would lose the earlier one.
+    currentConfig = newCfg;
+    app.savePluginOptions(newCfg, (err) => {
+      if (err) {
+        app.error(
+          `Failed to persist containerOverrides to disk: ${err.message}. ` +
+            `The override is applied live to the container but will be ` +
+            `lost on the next Signal K restart.`,
+        );
+      } else {
+        app.debug(`recordOverride(${name}): persisted to plugin-config-data`);
+      }
+    });
+  }
 
   const api: ContainerManagerApi = {
     getRuntime() {
@@ -330,8 +408,9 @@ module.exports = (app: App) => {
           );
         }
         // Live state already matches the request — true no-op.
-        // Update the cache so it stops lying if it was stale.
+        // Update the caches so they stop lying if they were stale.
         effectiveResources.set(name, { ...filteredLimits });
+        recordOverride(name, limits);
         return {
           method: "live",
           warnings: warnings.length ? warnings : undefined,
@@ -366,6 +445,7 @@ module.exports = (app: App) => {
         : await tryLiveUpdate(runtimeInfo, fullName, filteredLimits);
       if (live.ok) {
         effectiveResources.set(name, { ...filteredLimits });
+        recordOverride(name, limits);
         // Also keep the cached ContainerConfig in sync so that a
         // future recreate (e.g. on plugin restart) preserves the
         // newer limits.
@@ -482,6 +562,7 @@ module.exports = (app: App) => {
 
       lastConfigs.set(name, newConfig);
       effectiveResources.set(name, { ...filteredLimits });
+      recordOverride(name, limits);
       return { method: "recreated", warnings };
     },
 
@@ -616,6 +697,10 @@ module.exports = (app: App) => {
     },
 
     start(config: PluginConfig) {
+      // Cache the full config object so recordOverride() can rebuild it
+      // when persisting a new override via savePluginOptions. Shallow
+      // copy to avoid mutating the caller's object.
+      currentConfig = { ...config };
       // Cache user-supplied per-container resource overrides. These
       // are merged into every ensureRunning() call so consumer
       // plugins automatically pick them up. The user can edit them
@@ -747,6 +832,7 @@ module.exports = (app: App) => {
       lastConfigs.clear();
       effectiveResources.clear();
       currentOverrides = {};
+      currentConfig = null;
       delete (globalThis as any).__signalk_containerManager;
     },
 
@@ -803,7 +889,15 @@ module.exports = (app: App) => {
         const limits = (req.body ?? {}) as ContainerResourceLimits;
         try {
           const result = await api.updateResources(name, limits);
-          res.json({ name, ...result, effective: api.getResources(name) });
+          res.json({
+            name,
+            ...result,
+            effective: api.getResources(name),
+            // Mirror what GET returns so the frontend can derive its
+            // "Override active" badge from a single source (POST
+            // response on click, GET response on reload).
+            override: currentOverrides[name] ?? null,
+          });
         } catch (err) {
           res.status(500).json({
             error: err instanceof Error ? err.message : "Unknown error",

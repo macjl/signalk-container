@@ -720,10 +720,11 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     cfg.backgroundUpdateChecks !== false,
   );
   // containerOverrides is a Record<string, ContainerResourceLimits> keyed
-  // by the UNPREFIXED container name. The inline resource editor below
-  // mutates this local state; clicking "Save Configuration" persists it.
-  // Individual "Apply" buttons also POST to /api/containers/:name/resources
-  // for immediate live effect on the running container.
+  // by the UNPREFIXED container name. Spread into `doSave` so the global
+  // Save Configuration button persists it alongside the other settings,
+  // but the primary persistence path is now the backend's automatic
+  // savePluginOptions inside updateResources. This React state is just a
+  // cache for the Save button's round-trip.
   const [containerOverrides, setContainerOverrides] = useState(
     cfg.containerOverrides || {},
   );
@@ -731,8 +732,16 @@ export default function PluginConfigurationPanel({ configuration, save }) {
   const [runtimeInfo, setRuntimeInfo] = useState(null);
   const [containers, setContainers] = useState([]);
   // Per-container effective resource limits, keyed by UNPREFIXED name.
-  // Populated by fetchResourceLimits() which hits /api/containers/:name/resources.
+  // Populated by fetchStatus() which hits /api/containers/:name/resources.
   const [effectiveLimits, setEffectiveLimits] = useState({});
+  // Per-container `override` field as reported by the server, keyed by
+  // UNPREFIXED name. The "Override active" badge derives from THIS, not
+  // from the React containerOverrides state, so a browser reload (which
+  // wipes local state and re-reads from the server) still shows the
+  // badge correctly. A null value here means "no override recorded by
+  // the server"; a non-null object (even an empty one) means "override
+  // exists".
+  const [overrideStates, setOverrideStates] = useState({});
   // Which container rows have their resource editor expanded.
   const [expandedLimits, setExpandedLimits] = useState(new Set());
   const [loading, setLoading] = useState(true);
@@ -761,11 +770,13 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         setContainers([]);
       }
 
-      // Fetch effective resource limits for each container in parallel.
-      // This is a secondary fetch — if it fails we just show empty badges
-      // rather than errorring the whole panel.
+      // Fetch effective resource limits AND user-override state for each
+      // container in parallel. Best-effort: failures just leave empty
+      // badges rather than erroring the whole panel. Both fields are
+      // keyed by the UNPREFIXED container name.
       if (ctList.length > 0) {
         const limitsMap = {};
+        const overrideMap = {};
         await Promise.all(
           ctList.map(async (ct) => {
             const un = unprefixed(ct.name);
@@ -776,6 +787,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
               if (r.ok) {
                 const body = await r.json();
                 limitsMap[un] = body.effective || {};
+                overrideMap[un] = body.override ?? null;
               }
             } catch {
               // Best effort only.
@@ -783,6 +795,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
           }),
         );
         setEffectiveLimits(limitsMap);
+        setOverrideStates(overrideMap);
       }
     } catch {
       setRuntimeInfo(null);
@@ -830,14 +843,30 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         [unprefixedName]: data.effective,
       }));
     }
-    // Also stage the payload into containerOverrides so the global
-    // Save Configuration button will persist it to plugin-config-data.
-    // We deliberately store the user's raw payload (with nulls) rather
-    // than the merged effective, so the on-disk config stays minimal.
-    setContainerOverrides((prev) => ({
+    // Update the local overrideStates cache from the response's
+    // `override` field. This is what the "Override active" badge reads,
+    // so the user sees the badge flip on immediately after Apply. The
+    // backend (v0.1.8+) also persists this to plugin-config-data via
+    // savePluginOptions, so a browser reload re-fetches it via
+    // fetchStatus() and the badge reappears.
+    setOverrideStates((prev) => ({
       ...prev,
-      [unprefixedName]: payload,
+      [unprefixedName]: data.override ?? null,
     }));
+    // Keep the React containerOverrides state in sync too so the global
+    // Save Configuration button's spread-then-overwrite path preserves
+    // the same override. This is defense-in-depth — the backend already
+    // persisted via savePluginOptions, but if the user clicks Save
+    // Configuration they should see their overrides preserved.
+    setContainerOverrides((prev) => {
+      const next = { ...prev };
+      if (data.override && Object.keys(data.override).length > 0) {
+        next[unprefixedName] = data.override;
+      } else {
+        delete next[unprefixedName];
+      }
+      return next;
+    });
     return {
       method: data.method,
       warnings: data.warnings,
@@ -852,6 +881,19 @@ export default function PluginConfigurationPanel({ configuration, save }) {
     // containerOverrides) that weren't visible in the form. Any
     // field we DO manage is written after the spread so our in-form
     // values win.
+    //
+    // For containerOverrides specifically: v0.1.8 has the backend
+    // auto-persist on every Apply click via savePluginOptions, so
+    // the disk state is usually ahead of any local React state.
+    // To avoid overwriting that with stale React state, derive
+    // containerOverrides from the server-reported overrideStates
+    // (which the 5s poll keeps fresh). Skip null entries.
+    const overridesFromServer = {};
+    for (const [name, ov] of Object.entries(overrideStates)) {
+      if (ov && Object.keys(ov).length > 0) {
+        overridesFromServer[name] = ov;
+      }
+    }
     save({
       ...cfg,
       runtime,
@@ -859,7 +901,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
       maxConcurrentJobs: cfg.maxConcurrentJobs || 2,
       updateCheckInterval,
       backgroundUpdateChecks,
-      containerOverrides,
+      containerOverrides: overridesFromServer,
     });
     setActionStatus("Saved! Plugin will restart.");
     setStatusError(false);
@@ -1071,9 +1113,13 @@ export default function PluginConfigurationPanel({ configuration, save }) {
         containers.map((ct) => {
           const un = unprefixed(ct.name);
           const eff = effectiveLimits[un] || {};
+          // Badge reads from the SERVER response (overrideStates),
+          // not from the React containerOverrides state. This makes
+          // it refresh-safe: the badge reflects what the backend
+          // knows, which persists across browser reloads.
+          const serverOverride = overrideStates[un];
           const hasOverride =
-            containerOverrides[un] &&
-            Object.keys(containerOverrides[un]).length > 0;
+            serverOverride && Object.keys(serverOverride).length > 0;
           const isExpanded = expandedLimits.has(un);
           const badges = RESOURCE_FIELDS.map((f) =>
             formatLimitBadge(f.key, eff[f.key]),
@@ -1165,7 +1211,7 @@ export default function PluginConfigurationPanel({ configuration, save }) {
                 <ResourceLimitsEditor
                   containerName={un}
                   effective={eff}
-                  initialOverride={containerOverrides[un]}
+                  initialOverride={serverOverride}
                   onApply={(payload) => applyLimits(un, payload)}
                   onClose={() => toggleLimitsExpand(ct.name)}
                 />
