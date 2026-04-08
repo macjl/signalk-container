@@ -328,6 +328,35 @@ Lists all `sk-` prefixed containers.
 
 Returns the local image ID (sha256 digest) for an image reference or container name. Returns `null` if not present locally. Used internally by the update detection service for floating-tag drift checks, but exposed to plugins that want to do their own digest comparison.
 
+### `getResources(name): ContainerResourceLimits`
+
+Returns the currently effective (merged plugin default + user override) resource limits for a managed container. Empty object `{}` if the container isn't tracked or has no limits.
+
+```typescript
+const effective = containers.getResources("my-db");
+// → { cpus: 2, memory: "1g", memorySwap: "1g", pidsLimit: 200 }
+```
+
+Prefer this over direct `podman inspect` because it reflects the merge logic and stays in sync with user overrides applied via the config panel or REST API. For the raw user override (the diff stored in plugin config), read `GET /api/containers/:name/resources` which also returns an `override` field.
+
+### `updateResources(name, limits): Promise<UpdateResourcesResult>`
+
+Apply new resource limits to a running container, merging `limits` against the consumer plugin's pristine default captured at `ensureRunning` time. Tries `podman update` first (live, no downtime), falls back to stop+remove+ensureRunning if the runtime refuses (e.g. `cpusetCpus` on a host without cgroup delegation, or unsetting a `memory` limit which create-time-only fields can't do live).
+
+```typescript
+const result = await containers.updateResources("my-db", {
+  cpus: 3.0, // just the field the user changed
+});
+console.log(result.method); // "live" or "recreated"
+console.log(result.warnings); // optional messages (e.g. cgroup drops)
+```
+
+The input `limits` is treated as a diff: fields you don't include are inherited from the plugin default. Fields set to `null` are explicit unsets. The minimized override (only fields actually different from the default) is stored in plugin config and persisted automatically via `savePluginOptions`.
+
+If the recreate path is taken and fails, signalk-container attempts rollback to the previous working config before throwing. If rollback also fails, the plugin enters an error state and the error message names both failures clearly.
+
+Throws if `name` has no cached `ContainerConfig` — i.e. if the consumer plugin hasn't called `ensureRunning` yet during this Signal K session. That's normally impossible during normal operation since consumer plugins always call `ensureRunning` at startup.
+
 ---
 
 ## Update Detection
@@ -608,6 +637,42 @@ This is the same data exposed via `GET /plugins/signalk-container/api/containers
 3. **Don't pin to core 0 by default** (`cpusetCpus: "0"`). Signal K's event loop usually lives there.
 4. **`updateResources` is callable any time** but the cached config used for recreate fallback comes from your most recent `ensureRunning()` call. If you've never called `ensureRunning`, recreate will throw with a clear error.
 5. **`cpuset-cpus` and `oom-score-adj` cannot be live-updated.** Setting either forces the recreate fallback.
+
+### v0.1.8 semantic refinements (important for plugin authors)
+
+v0.1.8 tightened the merge semantics so the system behaves predictably across plugin updates and user interactions. As a plugin author you don't need to do anything special — these are invariants signalk-container enforces automatically — but understanding them helps you reason about edge cases.
+
+**1. Stored overrides are minimized against your plugin default.**
+
+When a user applies an override via the UI or REST API, signalk-container compares the submitted payload against your pristine `config.resources` (captured at `ensureRunning` time) and stores only the fields that actually differ. For example, if your default is `{cpus: 1.5, memory: "512m", memorySwap: "512m", pidsLimit: 200}` and the user applies `{cpus: 2, memory: "512m", memorySwap: "512m", pidsLimit: 200}` (because the form was seeded from current effective state), the stored override becomes just `{cpus: 2}` — the memory/swap/pids values match the default, so they're dropped.
+
+Consequence: **if you bump your plugin's default memory from `"512m"` to `"1g"` in a future version, users who only overrode `cpus` automatically get the new memory default.** Their override doesn't pin them to the old value.
+
+**2. `updateResources` merges the payload against your plugin default before applying.**
+
+When the user POSTs `{cpus: 2}` to `/api/containers/:name/resources`, signalk-container internally does `mergeResourceLimits(pluginDefault, {cpus: 2})` before applying to the container. The container ends up with `{cpus: 2, memory: "512m", memorySwap: "512m", pidsLimit: 200}` — the user's change plus all of your defaults. Without this merge, the user's partial payload would wipe the other fields.
+
+Consequence: **users can submit partial payloads without losing your other defaults.** Scripts hitting the REST API don't need to know your full default set.
+
+**3. Reset-to-default via `DELETE /api/containers/:name/resources`.**
+
+The UI's "Reset to default" button and the DELETE endpoint do three things atomically: apply your pristine `config.resources` to the running container (live or via recreate), clear the user's stored override (`containerOverrides[name]` → deleted from plugin config), and persist the cleared state to disk. Users can go back to "pure plugin default" with one click, including explicit unsets that would otherwise require a manual JSON edit.
+
+**4. `getContainerState` is robust against transient runtime state flap.**
+
+The underlying podman/docker `inspect` call can briefly report inconsistent `.State.Status` values under concurrent load (observed on rootless podman with systemd cgroup delegation). v0.1.8's `getContainerState` queries three fields — `Status`, `Running`, and `Pid` — and reports `"running"` if any of them indicate running. This prevents the update service's state gate from misfiring and skipping legitimate checks.
+
+**5. The `effectiveResources` cache is no longer trusted for no-op decisions.**
+
+Prior versions compared the incoming `updateResources` payload against the in-memory `effectiveResources` cache to detect no-ops. v0.1.8 instead calls `getLiveResources()` (podman inspect) and compares against actual cgroup state. This means:
+
+- Stale cache entries after a buggy predecessor run no longer mask reality
+- Manual `podman update` from outside Signal K is detected on the next updateResources call
+- Container state drift from any source is handled correctly
+
+**6. The config panel form re-seeds from server truth after every Apply / Reset.**
+
+The inline ResourceLimitsEditor updates its form inputs from the server's post-action `effective` state after Apply or Reset. This eliminates the class of bug where a user's stale form values could silently re-submit on accidental Apply after a Reset.
 
 ---
 

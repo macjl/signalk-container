@@ -9,25 +9,54 @@ Instead of each plugin implementing its own container orchestration, they delega
 - **Runtime detection** -- Podman preferred, Docker fallback, podman-shim aware
 - **Container lifecycle** -- pull, create, start, stop, remove with `sk-` prefix naming
 - **One-shot jobs** -- run containers for batch tasks (export, conversion, etc.)
-- **Update detection** -- centralized "is there a newer image?" service for all consumer plugins. Auto-detects semver vs floating tags (`:latest`, `:main`), offline-tolerant with persistent cache, emits Signal K notifications. See the [developer guide](doc/plugin-developer-guide.md#update-detection).
-- **Resource limits** -- per-container CPU/memory/PID caps so a runaway container can't take down the boat. Consumer plugin sets sensible defaults; user can override per-container in this plugin's config. Live-applied via `podman update` when possible, falls back to recreate. See the [developer guide](doc/plugin-developer-guide.md#resource-limits).
+- **Update detection** -- centralized "is there a newer image?" service for all consumer plugins. Auto-detects semver vs floating tags (`:latest`, `:main`), offline-tolerant with persistent cache, emits Signal K notifications, visible inline in the config panel. See the [developer guide](doc/plugin-developer-guide.md#update-detection).
+- **Resource limits editor** -- interactive UI in the config panel for setting CPU/memory/PID caps per container. Values are applied live via `podman update` when possible (no downtime), falls back to recreate when needed. Stored overrides are minimized against the consumer plugin's defaults so a future default bump flows through automatically. See the [developer guide](doc/plugin-developer-guide.md#resource-limits).
+- **Reset to plugin default** -- one-click restore of a container's original resource limits, clearing any user override.
 - **Image management** -- scheduled pruning of dangling images (weekly/monthly)
 - **SELinux support** -- `:Z` volume flags for Podman on Fedora/RHEL
 - **Podman image qualification** -- automatically prefixes `docker.io/` for short image names
-- **Config panel** -- runtime status, managed containers with start/stop/remove controls, prune button
 - **Cross-plugin API** -- other plugins use `globalThis.__signalk_containerManager`
 
 ## Config Panel
 
-The plugin embeds a React config panel in the Signal K Admin UI (via Module Federation) showing:
+The plugin embeds a React config panel in the Signal K Admin UI (via Module Federation). It's the recommended way to manage containers — you shouldn't need to edit JSON directly.
 
-- Detected runtime with version and status indicator
-- List of managed containers with state (green=running, yellow=stopped)
-- **Start** button for stopped containers
-- **Stop** button for running containers
-- **Remove** button with confirmation dialog when container is running
-- Prune dangling images button
-- Settings for preferred runtime and auto-prune schedule
+### Runtime section
+
+- Detected runtime with version (Podman or Docker)
+- Green status indicator when available, red if no runtime was found
+
+### Settings
+
+- **Preferred runtime** -- auto-detect, or force `podman`/`docker`
+- **Auto-prune images** -- off, weekly, or monthly scheduled cleanup of dangling images
+- **Update check interval** -- how often to check consumer plugins for new container images (1h to 1 week, default 24h)
+- **Background update checks** -- toggle for metered connections; manual checks still work when off
+
+### Managed Containers (one card per running or stopped container)
+
+- Container name, image, state, and port mappings
+- **Start** / **Stop** / **Remove** buttons appropriate to the current state
+- **Current effective resource limits** shown as compact badges (e.g. `1.5 CPU · 512m · 200 PIDs`)
+- **Override active** amber badge when the user has configured a resource override for the container
+- **Updates row** (when the consumer plugin has registered with the update service):
+  - Color-coded badge: `✓ up to date`, `↑ v3.4.0 available`, `↻ rebuild available` (floating tag), `📡 offline` (with cached state fallback), `⚠ check error`
+  - "checked 5m ago" staleness indicator
+  - **Check now ↻** button for an immediate fresh check
+
+### Resource Limits Editor (expands inline when you click "Edit Limits" on a running container)
+
+- Four primary fields visible by default: CPU cores, Memory, Memory+swap, Max processes
+- **Advanced** section (collapsed) for CPU shares, CPU pinning, memory reservation, OOM score adjust
+- **× button** next to each field to explicitly unset (send `null`, removing a plugin-default limit)
+- **Apply** -- live update where possible, recreate where needed, with a clear result box showing which method was used and any warnings (e.g. "dropped cpusetCpus — not delegated by cgroups")
+- **Revert** -- discard unsaved form edits, re-seed from current effective state
+- **Reset to default** -- clear the user override entirely and restore the consumer plugin's pristine default limits (confirmation dialog warns about possible recreate)
+- After Apply or Reset, the form re-seeds from the server's fresh state so the inputs always match what's actually running
+
+### Maintenance
+
+- **Prune Dangling Images** button with before/after space reclaimed summary
 
 ## How Other Plugins Use It
 
@@ -92,20 +121,21 @@ See [doc/plugin-developer-guide.md](doc/plugin-developer-guide.md) for the full 
 
 All mounted at `/plugins/signalk-container/api/`:
 
-| Method | Path                          | Description                                             |
-| ------ | ----------------------------- | ------------------------------------------------------- |
-| GET    | `/runtime`                    | Detected runtime info                                   |
-| GET    | `/containers`                 | List managed containers                                 |
-| GET    | `/containers/:name/state`     | Container state                                         |
-| POST   | `/containers/:name/start`     | Start a stopped container                               |
-| POST   | `/containers/:name/stop`      | Stop a running container                                |
-| POST   | `/containers/:name/remove`    | Stop and remove a container                             |
-| POST   | `/prune`                      | Prune dangling images                                   |
-| GET    | `/updates`                    | List last update-check results                          |
-| GET    | `/updates/:pluginId`          | Last update-check result for one plugin                 |
-| POST   | `/updates/:pluginId/check`    | Force a fresh update check (HTTP 200 even when offline) |
-| GET    | `/containers/:name/resources` | Effective resource limits + user override               |
-| POST   | `/containers/:name/resources` | Apply new resource limits (live or recreate)            |
+| Method | Path                          | Description                                                                                                                   |
+| ------ | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/runtime`                    | Detected runtime info                                                                                                         |
+| GET    | `/containers`                 | List managed containers                                                                                                       |
+| GET    | `/containers/:name/state`     | Container state                                                                                                               |
+| POST   | `/containers/:name/start`     | Start a stopped container                                                                                                     |
+| POST   | `/containers/:name/stop`      | Stop a running container                                                                                                      |
+| POST   | `/containers/:name/remove`    | Stop and remove a container                                                                                                   |
+| POST   | `/prune`                      | Prune dangling images                                                                                                         |
+| GET    | `/updates`                    | List last update-check results                                                                                                |
+| GET    | `/updates/:pluginId`          | Last update-check result for one plugin                                                                                       |
+| POST   | `/updates/:pluginId/check`    | Force a fresh update check (HTTP 200 even when offline)                                                                       |
+| GET    | `/containers/:name/resources` | Effective resource limits + user override                                                                                     |
+| POST   | `/containers/:name/resources` | Apply new resource limits (live or recreate). Body is a `ContainerResourceLimits` diff against the consumer plugin's default. |
+| DELETE | `/containers/:name/resources` | Clear any user override and restore the consumer plugin's pristine default limits to the running container.                   |
 
 ## Configuration
 
@@ -120,44 +150,55 @@ All mounted at `/plugins/signalk-container/api/`:
 
 ## Setting Resource Limits
 
-On a boat with limited compute (typically a Pi 4/5 or low-power x86 mini PC), one runaway container can starve Signal K, raise NMEA decode latency, trigger thermal throttling, or even take the host down via OOM. signalk-container exposes podman/docker resource flags so consumer plugins can set sensible defaults — and you, as the user, can override them per-container without touching code.
+On a boat with limited compute (typically a Pi 4/5 or low-power x86 mini PC), one runaway container can starve Signal K, raise NMEA decode latency, trigger thermal throttling, or even take the host down via OOM. signalk-container exposes podman/docker resource flags so consumer plugins can set sensible defaults — and you, as the user, can tune them per-container in two ways: **the config panel UI (recommended)** or direct JSON edit (for scripted/automated setups).
 
 ### How it works
 
-Each consumer plugin (signalk-questdb, signalk-grafana, mayara, etc.) declares default CPU/memory limits when it starts its container. You can override any of these via the **Per-container resource overrides** field in this plugin's config. Your override is **merged field-by-field** on top of the plugin's defaults — you don't have to know what the plugin already set, just specify what you want different.
+Each consumer plugin (signalk-questdb, signalk-grafana, mayara, etc.) declares default CPU/memory limits when it starts its container. Your override is **merged field-by-field** on top of the plugin's defaults, and only the fields that actually differ from the default get stored. This means if a future plugin version bumps its memory default from 512m to 1g, your override for just `cpus` will automatically pick up the new memory value — no manual edit needed.
 
-### Example: capping mayara at 1.5 CPU cores and 512 MB
+### Using the Config Panel (recommended)
 
-In the signalk-container plugin config UI, set **Per-container resource overrides** to:
+1. Open the Signal K admin UI → Plugin Config → **Container Manager**
+2. Find the container you want to tune in the "Managed Containers" list
+3. Click **Edit Limits ▸** on the row
+4. Edit the CPU cores, Memory, Memory+swap, or Max processes fields. Use the × button next to a field to explicitly unset a limit the plugin set. Click **Advanced** to access cpuShares, cpusetCpus, memoryReservation, and oomScoreAdj.
+5. Click **Apply** — live updated where possible (no downtime), recreated where needed. The result box shows which method was used plus any warnings.
+6. To restore the plugin's default: click **Reset to default** (amber button). This clears your override and applies the pristine default to the running container.
+
+The form re-seeds from the server's fresh state after every Apply or Reset, so the displayed values always match what's actually running.
+
+### Available fields
+
+| Field               | Example          | What it does                                                                                                                                                             |
+| ------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cpus`              | `1.5`            | Hard CPU cap. `1.5` = max 1.5 cores. The most important field for stability.                                                                                             |
+| `cpuShares`         | `512`            | Soft CPU weight under contention (default 1024). Lower = lower priority.                                                                                                 |
+| `cpusetCpus`        | `"1,2"`          | Pin to specific cores. Useful to keep heavy containers off core 0 where Signal K runs. May force a recreate on hosts where the cpuset cgroup controller isn't delegated. |
+| `memory`            | `"512m"`, `"2g"` | Hard memory cap. Container is OOM-killed if exceeded.                                                                                                                    |
+| `memorySwap`        | `"512m"`         | Memory + swap total. **Set equal to `memory` to disable swap entirely** — recommended on Pi/eMMC where swap is slow.                                                     |
+| `memoryReservation` | `"256m"`         | Soft memory floor. Kernel reclaims first from containers above this.                                                                                                     |
+| `pidsLimit`         | `200`            | Cap on processes/threads. Prevents fork bombs and thread leaks.                                                                                                          |
+| `oomScoreAdj`       | `500`            | OOM kill priority, -1000..1000. Higher = killed first when host runs out of memory. Set at container create time only — forces a recreate when changed.                  |
+
+### Direct JSON (scripted/advanced)
+
+The UI writes to a `containerOverrides` map in `plugin-config-data/signalk-container.json`. You can edit this directly if you prefer — useful for automation or bulk configuration:
 
 ```json
 {
-  "mayara-server": {
-    "cpus": 1.5,
-    "memory": "512m",
-    "memorySwap": "512m"
+  "configuration": {
+    "containerOverrides": {
+      "mayara-server": {
+        "cpus": 1.5,
+        "memory": "512m",
+        "memorySwap": "512m"
+      }
+    }
   }
 }
 ```
 
-The key (`mayara-server`) is the container name **without** the `sk-` prefix that signalk-container adds internally. After saving, restart the consumer plugin (or use the live update endpoint described below) for the new limits to take effect.
-
-### Available fields
-
-| Field               | Example          | What it does                                                                                                         |
-| ------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `cpus`              | `1.5`            | Hard CPU cap. `1.5` = max 1.5 cores. The most important field for stability.                                         |
-| `cpuShares`         | `512`            | Soft CPU weight under contention (default 1024). Lower = lower priority.                                             |
-| `cpusetCpus`        | `"1,2"`          | Pin to specific cores. Useful to keep heavy containers off core 0 where Signal K runs.                               |
-| `memory`            | `"512m"`, `"2g"` | Hard memory cap. Container is OOM-killed if exceeded.                                                                |
-| `memorySwap`        | `"512m"`         | Memory + swap total. **Set equal to `memory` to disable swap entirely** — recommended on Pi/eMMC where swap is slow. |
-| `memoryReservation` | `"256m"`         | Soft memory floor. Kernel reclaims first from containers above this.                                                 |
-| `pidsLimit`         | `200`            | Cap on processes/threads. Prevents fork bombs and thread leaks.                                                      |
-| `oomScoreAdj`       | `500`            | OOM kill priority, -1000..1000. Higher = killed first when host runs out of memory.                                  |
-
-### Removing a limit set by a plugin
-
-Use `null` to explicitly remove a limit that the consumer plugin set:
+The key (`mayara-server`) is the container name **without** the `sk-` prefix that signalk-container adds internally. Use `null` for a field to explicitly remove a limit set by the plugin:
 
 ```json
 {
@@ -165,33 +206,55 @@ Use `null` to explicitly remove a limit that the consumer plugin set:
 }
 ```
 
-This keeps mayara's CPU limit (whatever the plugin's default is) but removes the memory cap.
+After editing the file, restart the Container Manager plugin from the Signal K admin UI (or run the REST calls below) for the changes to take effect on running containers.
+
+### REST API (for scripts or external tools)
+
+```bash
+# Read current state
+curl http://localhost:3000/plugins/signalk-container/api/containers/mayara-server/resources
+
+# Apply a new override (live or recreate as needed)
+curl -X POST http://localhost:3000/plugins/signalk-container/api/containers/mayara-server/resources \
+  -H 'Content-Type: application/json' \
+  -d '{"cpus": 2}'
+
+# Reset to plugin default (clear the override)
+curl -X DELETE http://localhost:3000/plugins/signalk-container/api/containers/mayara-server/resources
+```
 
 ### When changes take effect
 
-- **For containers not yet started**: the next time the consumer plugin calls `ensureRunning`, your override is automatically merged in.
-- **For already-running containers**: the consumer plugin (or the REST API) needs to call `updateResources`. signalk-container tries `podman update` / `docker update` first (instantaneous, no downtime), and falls back to stop+remove+create if the runtime can't apply the change live (e.g. `cpusetCpus` or `oomScoreAdj`, which are set at create time only).
-- **The simplest path**: restart the consumer plugin via the Signal K admin UI after saving overrides. signalk-container will pick up the new merged limits on the next `ensureRunning` call.
+- **Immediately via the UI or REST API** (`updateResources`): signalk-container tries `podman update` / `docker update` first (instantaneous, no downtime). Falls back to stop+remove+create if the runtime can't apply the change live (e.g. unsetting memory limits, or changing `cpusetCpus` / `oomScoreAdj` which are set at container create time only).
+- **On next consumer plugin restart**: the merge happens automatically inside `ensureRunning` — useful for installations that manage via JSON edits and don't want to use the REST API.
+- **Persistence**: overrides applied via the UI or REST API are auto-persisted to `plugin-config-data/signalk-container.json` — they survive Signal K restarts without any extra action.
 
 ### Verifying limits are applied
 
-Check the live container with podman or docker:
+Check the live container directly:
 
 ```bash
 podman inspect sk-mayara-server --format '
   cpus={{.HostConfig.NanoCpus}}
   memory={{.HostConfig.Memory}}
+  pids={{.HostConfig.PidsLimit}}
 '
 ```
 
 `NanoCpus` is in CPU-nanoseconds per second; `1500000000` = 1.5 cores. Memory is in bytes.
 
-Or query the API:
+Or via the REST API:
 
 ```bash
-curl http://localhost:3000/plugins/signalk-container/api/containers/mayara-server/resources
-# {"name":"mayara-server","effective":{"cpus":1.5,"memory":"512m"},"override":{"cpus":1.5,"memory":"512m"}}
+curl http://localhost:3000/plugins/signalk-container/api/containers/mayara-server/resources | jq
+# {
+#   "name": "mayara-server",
+#   "effective": { "cpus": 1.5, "memory": "512m", ... },  // what's actually applied
+#   "override": { "cpus": 1.5 }                            // only what the user changed
+# }
 ```
+
+Note that `override` contains only the fields that differ from the consumer plugin's default — this minimization is automatic and lets future plugin default bumps flow through without you having to re-edit your override.
 
 ### Picking the right values
 
