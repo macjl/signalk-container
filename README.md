@@ -13,7 +13,8 @@ Instead of each plugin implementing its own container orchestration, they delega
 - **Resource limits editor** -- interactive UI in the config panel for setting CPU/memory/PID caps per container. Values are applied live via `podman update` when possible (no downtime), falls back to recreate when needed. Stored overrides are minimized against the consumer plugin's defaults so a future default bump flows through automatically. See the [developer guide](doc/plugin-developer-guide.md#resource-limits).
 - **Reset to plugin default** -- one-click restore of a container's original resource limits, clearing any user override.
 - **Image management** -- scheduled pruning of dangling images (weekly/monthly)
-- **SELinux support** -- `:Z` volume flags for Podman on Fedora/RHEL
+- **Zero-config data dir sharing** -- `signalkDataMount` mounts the SignalK data directory into any managed container automatically, whether Signal K runs bare-metal, in Docker (named volume), or in Podman (named volume or bind mount). No host paths to configure.
+- **SELinux support** -- `:Z` volume flags for Podman bind mounts on Fedora/RHEL; named volumes are handled correctly (`:Z` is not applied)
 - **Podman image qualification** -- automatically prefixes `docker.io/` for short image names
 - **Cross-plugin API** -- other plugins use `globalThis.__signalk_containerManager`
 
@@ -116,6 +117,7 @@ See [doc/plugin-developer-guide.md](doc/plugin-developer-guide.md) for the full 
 | `updates.getLastResult(pluginId)`       | Cached last result, no network                               |
 | `updateResources(name, limits)`         | Apply new resource limits live, fall back to recreate        |
 | `getResources(name)`                    | Currently effective limits (plugin defaults ⊕ user override) |
+| `resolveSignalkDataMount()`             | Resolve the volume name or host path that backs `app.getDataDirPath()` in the current deployment; returns `null` if the runtime is not yet initialised |
 
 ## REST Endpoints
 
@@ -147,6 +149,49 @@ All mounted at `/plugins/signalk-container/api/`:
 | Update check interval    | `24h`    | How often to check for container image updates (e.g. `24h`, `12h`, `1h`). Min 1h.                                              |
 | Background update checks | `true`   | Periodically check for updates in the background. Disable on metered connections — manual checks via the UI button still work. |
 | Container overrides      | `{}`     | Per-container resource limits (CPU, memory, PIDs). Field-level merged on top of consumer plugin defaults. See dev guide.       |
+
+## Mounting the SignalK data directory (`signalkDataMount`)
+
+When a managed container needs to read or write files that Signal K also accesses (e.g. HLS segments, exports, caches), use `signalkDataMount` instead of computing and hardcoding a host path or volume name.
+
+```typescript
+const SK_MOUNT = "/signalk-data";
+
+await containers.ensureRunning("my-worker", {
+  image: "myorg/myworker",
+  tag: "latest",
+  signalkDataMount: SK_MOUNT,   // ← mount the SignalK data dir here
+  command: [
+    "--output",
+    path.join(SK_MOUNT, "my-plugin/output/result.bin"),
+  ],
+});
+```
+
+signalk-container resolves the correct source automatically:
+
+| Deployment | What gets mounted |
+| --- | --- |
+| Bare-metal Signal K | `app.getDataDirPath()` as a bind mount (already a host path) |
+| Docker, volume-backed data dir | the named volume (e.g. `mystack_signalk-data`) |
+| Docker, bind-backed data dir | the exact host path, even when a parent directory is bind-mounted |
+| Podman (rootless or root) | same logic; named volumes receive no `:Z` flag |
+
+The content at `SK_MOUNT` inside the managed container always corresponds to the root of `app.getDataDirPath()`. Build paths using `path.join`:
+
+```typescript
+// Path inside managed container that corresponds to an absolute SignalK path:
+const containerPath = path.join(SK_MOUNT, path.relative(app.getDataDirPath(), absSignalkPath));
+```
+
+> [!note]
+> Docker/Podman do not support subpath mounts on named volumes. If your data directory
+> is backed by a named volume, the entire volume is mounted at `SK_MOUNT`. Avoid writing
+> to paths inside `SK_MOUNT` that are also bind-mounted in the Signal K container (e.g.
+> a plugin's own directory if mounted with `./:/home/node/.signalk/node_modules/my-plugin`)
+> — those paths are not visible from inside the managed container.
+
+You can also call `containers.resolveSignalkDataMount()` if you need to inspect the resolved source at runtime (e.g. for logging).
 
 ## Setting Resource Limits
 

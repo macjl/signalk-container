@@ -39,6 +39,7 @@ import {
   qualifyImage as qualifyImageForRuntime,
   removeContainer,
   removeNetwork,
+  resolveSignalkDataSource,
   startContainer,
   stopContainer,
 } from "./containers";
@@ -87,6 +88,9 @@ module.exports = (app: App) => {
    */
   const lastConfigs = new Map<string, ContainerConfig>();
   let currentOverrides: Record<string, ContainerResourceLimits> = {};
+  // Cached result of resolveSignalkDataSource() — resolved once on first
+  // ensureRunning() call that uses signalkDataMount, then reused.
+  let cachedDataSource: string | null = null;
   const effectiveResources = new Map<string, ContainerResourceLimits>();
   // Pristine plugin-default resource limits, captured at the top of the
   // `api.ensureRunning` wrapper BEFORE the override merge. Lets the
@@ -234,6 +238,25 @@ module.exports = (app: App) => {
     ) {
       if (!runtimeInfo) throw new Error("No container runtime available");
 
+      // Resolve signalkDataMount → inject into volumes before anything else.
+      // We strip the field from the config so containers.ts / buildRunArgs
+      // never sees it (it only knows about plain volumes).
+      if (config.signalkDataMount) {
+        if (!cachedDataSource) {
+          const dataDir = app.getDataDirPath?.() ?? "/home/node/.signalk";
+          cachedDataSource = await resolveSignalkDataSource(dataDir, runtimeInfo);
+          app.debug(`signalkDataMount resolved: ${cachedDataSource}`);
+        }
+        const { signalkDataMount, ...rest } = config;
+        config = {
+          ...rest,
+          volumes: {
+            ...rest.volumes,
+            [signalkDataMount]: cachedDataSource,
+          },
+        };
+      }
+
       // Capture the plugin's pristine default resource limits BEFORE
       // merging with the user override. This is the only place in the
       // system that sees the "default" as a separate input; lastConfigs
@@ -352,6 +375,15 @@ module.exports = (app: App) => {
         }, 60000);
         healthTimers.set(name, timer);
       }
+    },
+
+    async resolveSignalkDataMount(): Promise<string | null> {
+      if (!runtimeInfo) return null;
+      if (!cachedDataSource) {
+        const dataDir = app.getDataDirPath?.() ?? "/home/node/.signalk";
+        cachedDataSource = await resolveSignalkDataSource(dataDir, runtimeInfo);
+      }
+      return cachedDataSource;
     },
 
     async start(name: string) {
@@ -911,6 +943,7 @@ module.exports = (app: App) => {
       pluginDefaults.clear();
       currentOverrides = {};
       currentConfig = null;
+      cachedDataSource = null;
       delete (globalThis as any).__signalk_containerManager;
     },
 
