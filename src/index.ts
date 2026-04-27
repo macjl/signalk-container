@@ -408,7 +408,12 @@ module.exports = (app: App) => {
     },
 
     async resolveSignalkDataMount(): Promise<string | null> {
-      if (!runtimeInfo) return null;
+      // Honor the documented contract: return null when we cannot
+      // resolve, never throw. ensureCachedDataSource() throws when
+      // app.getDataDirPath is unavailable; that's appropriate for
+      // ensureRunning (the caller asked us to mount it) but not for
+      // this introspection method.
+      if (!runtimeInfo || !app.getDataDirPath) return null;
       return ensureCachedDataSource();
     },
 

@@ -16,6 +16,31 @@ function prefixedName(name: string): string {
     : `${CONTAINER_PREFIX}${name}`;
 }
 
+/**
+ * Build the value for a `-v <source>:<dest>[:flags]` argument with the
+ * correct SELinux relabel suffix for the runtime.
+ *
+ * `:Z` is for SELinux relabelling of bind-mount host paths under Podman
+ * on Fedora/RHEL. Named volumes (no leading '/' or '.') reject `:Z` with
+ * "invalid option z for named volume", so we omit the flag for them.
+ *
+ * Used by both ContainerConfig.volumes (containers.ts) and JobConfig
+ * inputs/outputs (jobs.ts) so the named-volume guard stays in one place.
+ */
+export function volumeArg(
+  hostPath: string,
+  containerPath: string,
+  runtime: ContainerRuntimeInfo,
+  readOnly: boolean = false,
+): string {
+  const isNamedVolume = !hostPath.startsWith("/") && !hostPath.startsWith(".");
+  const flags: string[] = [];
+  if (readOnly) flags.push("ro");
+  if (runtime.runtime === "podman" && !isNamedVolume) flags.push("Z");
+  const suffix = flags.length > 0 ? `:${flags.join(",")}` : "";
+  return `${hostPath}:${containerPath}${suffix}`;
+}
+
 export function qualifyImage(
   image: string,
   runtime: ContainerRuntimeInfo,
@@ -298,14 +323,7 @@ function buildRunArgs(
 
   if (config.volumes) {
     for (const [containerPath, hostPath] of Object.entries(config.volumes)) {
-      // Named volumes (no leading '/' or './') don't support :Z — that flag
-      // is for SELinux relabelling of bind-mount host paths only.
-      // Applying :Z to a named volume causes Podman to error with
-      // "invalid option z for named volume".
-      const isNamedVolume =
-        !hostPath.startsWith("/") && !hostPath.startsWith(".");
-      const suffix = runtime.runtime === "podman" && !isNamedVolume ? ":Z" : "";
-      args.push("-v", `${hostPath}:${containerPath}${suffix}`);
+      args.push("-v", volumeArg(hostPath, containerPath, runtime));
     }
   }
 
