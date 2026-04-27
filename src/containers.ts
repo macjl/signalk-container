@@ -1,3 +1,4 @@
+import * as net from "net";
 import {
   ContainerConfig,
   ContainerInfo,
@@ -680,6 +681,89 @@ export async function resolveSignalkDataSource(
   // Bind mount. Compute the exact host path that corresponds to dataDir,
   // even when the bind covers a parent directory.
   return best.source + dataDir.slice(best.dest.length);
+}
+
+/**
+ * Find the lowest available TCP port on 127.0.0.1 starting at `preferred`.
+ * Probes by briefly binding a server socket — no race with Docker because
+ * Docker atomically re-checks availability at container-create time.
+ *
+ * Used by the `signalkAccessiblePorts` bare-metal path to prefer the
+ * declared port number while gracefully stepping over conflicts.
+ */
+export function findAvailablePort(preferred: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    if (preferred > 65535) {
+      reject(new Error("No available port found in range 1024–65535"));
+      return;
+    }
+    const server = net.createServer();
+    server.once("error", () => {
+      // Port in use — try the next one.
+      findAvailablePort(preferred + 1).then(resolve, reject);
+    });
+    server.once("listening", () => {
+      server.close(() => resolve(preferred));
+    });
+    server.listen(preferred, "127.0.0.1");
+  });
+}
+
+/**
+ * Return the user-defined Docker/Podman networks that the current SignalK
+ * container is connected to (i.e. networks other than the default `bridge`,
+ * `host`, or `none`).
+ *
+ * Used by the `signalkAccessiblePorts` containerized path to attach a
+ * managed container to SignalK's own network so the two can communicate
+ * via DNS name without exposing any host port.
+ *
+ * Returns:
+ *   - `null`    when running bare-metal, HOSTNAME is unset, or `docker inspect`
+ *               fails (e.g. host-network mode where HOSTNAME is the machine
+ *               name, not a container ID).  Callers should treat this like
+ *               bare-metal and publish ports instead.
+ *   - `string[]` (possibly empty) when inspect succeeds.  An empty array means
+ *               SignalK is only on the default bridge — callers should fall
+ *               back to `networkMode: container:<HOSTNAME>`.  A non-empty
+ *               array contains the user-defined network names to attach to.
+ */
+export async function resolveSignalkNetworks(
+  runtime: ContainerRuntimeInfo,
+  debug: (msg: string) => void = () => {},
+): Promise<string[] | null> {
+  if (!isContainerized()) return null;
+
+  const selfId = process.env.HOSTNAME ?? "";
+  if (!selfId) {
+    debug("resolveSignalkNetworks: HOSTNAME unset, returning null");
+    return null;
+  }
+
+  const result = await execRuntime(runtime, [
+    "inspect",
+    "--format",
+    "{{range $k,$v := .NetworkSettings.Networks}}{{$k}}\n{{end}}",
+    selfId,
+  ]);
+
+  if (result.exitCode !== 0) {
+    debug(
+      `resolveSignalkNetworks: inspect ${selfId} failed (exit=${result.exitCode}): ${result.stderr.trim()} — treating as bare-metal`,
+    );
+    return null;
+  }
+
+  const all = result.stdout.split("\n").filter(Boolean);
+  // The default bridge network does not support container-name DNS
+  // resolution, so exclude it along with the virtual modes.
+  const userDefined = all.filter(
+    (n) => n !== "bridge" && n !== "host" && n !== "none",
+  );
+  debug(
+    `resolveSignalkNetworks: all=${all.join(",")} userDefined=${userDefined.join(",")}`,
+  );
+  return userDefined;
 }
 
 export async function waitForReady(
